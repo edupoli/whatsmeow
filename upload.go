@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"time"
 
 	"go.mau.fi/util/random"
 
@@ -190,8 +191,11 @@ func (cli *Client) UploadNewsletterReader(ctx context.Context, data io.ReadSeeke
 
 func (cli *Client) rawUpload(ctx context.Context, dataToUpload io.Reader, uploadSize uint64, fileHash []byte, appInfo MediaType, newsletter bool, resp *UploadResponse) error {
 	mediaConn, err := cli.refreshMediaConn(false)
-	if err != nil {
-		return fmt.Errorf("failed to refresh media connections: %w", err)
+	if err != nil || time.Now().After(mediaConn.Expiry()) {
+		mediaConn, err = cli.refreshMediaConn(true)
+		if err != nil {
+			return fmt.Errorf("failed to refresh media connections: %w", err)
+		}
 	}
 
 	token := base64.URLEncoding.EncodeToString(fileHash)
