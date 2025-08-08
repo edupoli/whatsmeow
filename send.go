@@ -819,6 +819,8 @@ func (cli *Client) sendDM(
 
 func getTypeFromMessage(msg *waE2E.Message) string {
 	switch {
+	case msg.ListMessage != nil:
+		return "text"
 	case msg.ViewOnceMessage != nil:
 		return getTypeFromMessage(msg.ViewOnceMessage.Message)
 	case msg.ViewOnceMessageV2 != nil:
