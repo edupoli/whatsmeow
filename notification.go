@@ -409,8 +409,7 @@ func (cli *Client) handleStatusNotification(ctx context.Context, node *waBinary.
 	})
 }
 
-func (cli *Client) handleNotification(node *waBinary.Node) {
-	ctx := cli.BackgroundEventCtx
+func (cli *Client) handleNotification(ctx context.Context, node *waBinary.Node) {
 	ag := node.AttrGetter()
 	notifType := ag.String("type")
 	if !ag.OK() {
@@ -430,13 +429,17 @@ func (cli *Client) handleNotification(node *waBinary.Node) {
 	case "fbid:devices":
 		cli.handleFBDeviceNotification(ctx, node)
 	case "w:gp2":
-		evt, lidPairs, err := cli.parseGroupNotification(node)
+		evt, lidPairs, redactedPhones, err := cli.parseGroupNotification(node)
 		if err != nil {
 			cli.Log.Errorf("Failed to parse group notification: %v", err)
 		} else {
 			err = cli.Store.LIDs.PutManyLIDMappings(ctx, lidPairs)
 			if err != nil {
 				cli.Log.Errorf("Failed to store LID mappings from group notification: %v", err)
+			}
+			err = cli.Store.Contacts.PutManyRedactedPhones(ctx, redactedPhones)
+			if err != nil {
+				cli.Log.Warnf("Failed to store redacted phones from group notification: %v", err)
 			}
 			cancelled = cli.dispatchEvent(evt)
 		}
