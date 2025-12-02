@@ -966,6 +966,8 @@ func getButtonTypeFromMessage(msg *waE2E.Message) string {
 		return "buttons"
 	case msg.ButtonsResponseMessage != nil:
 		return "buttons_response"
+	case msg.InteractiveMessage != nil && msg.InteractiveMessage.GetNativeFlowMessage() != nil:
+		return "interactive"
 	case msg.ListMessage != nil:
 		return "list"
 	case msg.ListResponseMessage != nil:
@@ -987,6 +989,11 @@ func getButtonAttributes(msg *waE2E.Message) waBinary.Attrs {
 		return getButtonAttributes(msg.EphemeralMessage.Message)
 	case msg.TemplateMessage != nil:
 		return waBinary.Attrs{}
+	case msg.InteractiveMessage != nil && msg.InteractiveMessage.GetNativeFlowMessage() != nil:
+		return waBinary.Attrs{
+			"v":    "1",
+			"type": "native_flow",
+		}
 	case msg.ListMessage != nil:
 		return waBinary.Attrs{
 			"v":    "2",
@@ -1111,12 +1118,25 @@ func (cli *Client) getMessageContent(
 	}
 
 	if buttonType := getButtonTypeFromMessage(message); buttonType != "" {
+		bizContent := []waBinary.Node{{
+			Tag:   buttonType,
+			Attrs: getButtonAttributes(message),
+		}}
+
+		// Add native_flow sub-node for interactive messages
+		if buttonType == "interactive" && message.InteractiveMessage != nil && message.InteractiveMessage.GetNativeFlowMessage() != nil {
+			bizContent[0].Content = []waBinary.Node{{
+				Tag: "native_flow",
+				Attrs: waBinary.Attrs{
+					"v":    "9",
+					"name": "mixed",
+				},
+			}}
+		}
+
 		content = append(content, waBinary.Node{
-			Tag: "biz",
-			Content: []waBinary.Node{{
-				Tag:   buttonType,
-				Attrs: getButtonAttributes(message),
-			}},
+			Tag:     "biz",
+			Content: bizContent,
 		})
 	}
 	return content
