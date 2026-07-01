@@ -48,7 +48,3 @@ jobs:
             -F ref=main \
             -F "variables[UPDATE_WHATSMEOW]=true" \
             https://gitlab.com/api/v4/projects/${{ secrets.GITLAB_PROJECT_ID }}/trigger/pipeline
-
-      # mantém o repo "vivo" mesmo quando não há nada do upstream pra puxar
-      - name: Keep repo active
-        uses: gautamkrishnar/keepalive-workflow@v2
