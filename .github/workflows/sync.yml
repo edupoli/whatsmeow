@@ -11,7 +11,6 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -28,11 +27,28 @@ jobs:
           git remote add upstream https://github.com/tulir/whatsmeow.git
           git fetch upstream
 
+      - name: Capture SHA before rebase
+        id: before
+        run: echo "sha=$(git rev-parse main)" >> "$GITHUB_OUTPUT"
+
       - name: Rebase main on upstream
         run: |
-          git checkout main
           git rebase upstream/main
-
-      - name: Push rebased main
-        run: |
           git push origin main --force-with-lease
+
+      - name: Capture SHA after rebase
+        id: after
+        run: echo "sha=$(git rev-parse main)" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger app pipeline (only if changed)
+        if: steps.before.outputs.sha != steps.after.outputs.sha
+        run: |
+          curl --fail -X POST \
+            -F token=${{ secrets.GITLAB_TRIGGER_TOKEN }} \
+            -F ref=main \
+            -F "variables[UPDATE_WHATSMEOW]=true" \
+            https://gitlab.com/api/v4/projects/${{ secrets.GITLAB_PROJECT_ID }}/trigger/pipeline
+
+      # mantém o repo "vivo" mesmo quando não há nada do upstream pra puxar
+      - name: Keep repo active
+        uses: gautamkrishnar/keepalive-workflow@v2
