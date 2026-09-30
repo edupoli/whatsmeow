@@ -93,6 +93,9 @@ func (cli *Client) PairPhone(ctx context.Context, phone string, showPushNotifica
 	if cli == nil {
 		return "", ErrClientIsNil
 	}
+	if cli.Store.Mobile {
+		return "", ErrMobileCannotPair
+	}
 	ephemeralKeyPair, ephemeralKey, encodedLinkingCode := generateCompanionEphemeralKey()
 	phone = notNumbers.ReplaceAllString(phone, "")
 	if len(phone) <= 6 {

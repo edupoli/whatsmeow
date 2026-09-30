@@ -1126,7 +1126,7 @@ func (cli *Client) preparePeerMessageNode(
 			"appdata": "default",
 		},
 	}, *encrypted}
-	if isPreKey && cli.MessengerConfig == nil {
+	if isPreKey && cli.MessengerConfig == nil && !cli.Store.Mobile {
 		content = append(content, cli.makeDeviceIdentityNode())
 	}
 	return &waBinary.Node{
@@ -1144,7 +1144,7 @@ func (cli *Client) getMessageContent(
 	extraParams nodeExtraParams,
 ) []waBinary.Node {
 	content := []waBinary.Node{baseNode}
-	if includeIdentity {
+	if includeIdentity && !cli.Store.Mobile {
 		content = append(content, cli.makeDeviceIdentityNode())
 	}
 	if msgAttrs["type"] == "poll" {

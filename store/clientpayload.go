@@ -8,6 +8,7 @@ package store
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"strconv"
@@ -200,7 +201,57 @@ func (device *Device) getLoginPayload() *waWa6.ClientPayload {
 	return payload
 }
 
+func (device *Device) getMobileLoginPayload() *waWa6.ClientPayload {
+	if device.ID == nil || device.MobileVersion == "" {
+		return nil
+	}
+	versionParts := strings.Split(device.MobileVersion, ".")
+	if len(versionParts) != 4 {
+		return nil
+	}
+	version := make([]uint32, 4)
+	for i, part := range versionParts {
+		value, err := strconv.ParseUint(part, 10, 32)
+		if err != nil {
+			return nil
+		}
+		version[i] = uint32(value)
+	}
+	payload := proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
+	var sessionID [4]byte
+	if _, err := rand.Read(sessionID[:]); err != nil {
+		return nil
+	}
+	payload.SessionID = proto.Int32(int32(binary.BigEndian.Uint32(sessionID[:]) & 0x3fffffff))
+	payload.WebInfo = nil
+	payload.DevicePairingData = nil
+	payload.Username = proto.Uint64(device.ID.UserInt())
+	payload.Device = proto.Uint32(0)
+	payload.Passive = proto.Bool(false)
+	payload.PushName = proto.String(device.PushName)
+	payload.ShortConnect = proto.Bool(true)
+	payload.ConnectAttemptCount = proto.Uint32(0)
+	payload.Oc = proto.Bool(false)
+	payload.UserAgent.Platform = waWa6.ClientPayload_UserAgent_IOS.Enum()
+	payload.UserAgent.AppVersion = &waWa6.ClientPayload_UserAgent_AppVersion{
+		Primary: &version[0], Secondary: &version[1], Tertiary: &version[2], Quaternary: &version[3],
+	}
+	payload.UserAgent.Mcc = proto.String("000")
+	payload.UserAgent.Mnc = proto.String("000")
+	payload.UserAgent.OsVersion = proto.String(device.MobileOSVersion)
+	payload.UserAgent.OsBuildNumber = proto.String(device.MobileOSVersion)
+	payload.UserAgent.Manufacturer = proto.String("Apple")
+	payload.UserAgent.Device = proto.String(strings.ReplaceAll(device.MobileModel, "_", " "))
+	payload.UserAgent.PhoneID = proto.String(device.MobilePhoneID)
+	payload.UserAgent.DeviceType = waWa6.ClientPayload_UserAgent_PHONE.Enum()
+	payload.UserAgent.DeviceModelType = proto.String(strings.TrimPrefix(device.MobileModel, "Apple-"))
+	return payload
+}
+
 func (device *Device) GetClientPayload() *waWa6.ClientPayload {
+	if device.Mobile {
+		return device.getMobileLoginPayload()
+	}
 	if device.ID != nil {
 		if *device.ID == types.EmptyJID {
 			panic(fmt.Errorf("GetClientPayload called with empty JID"))

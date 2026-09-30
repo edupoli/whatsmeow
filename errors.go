@@ -30,6 +30,8 @@ var (
 
 	ErrQRAlreadyConnected = errors.New("GetQRChannel must be called before connecting")
 	ErrQRStoreContainsID  = errors.New("GetQRChannel can only be called when there's no user ID in the client's Store")
+	ErrMobileCannotPair   = errors.New("mobile primary devices register with a phone number, not companion pairing")
+	ErrMobileAlreadyRegistered = errors.New("client is already registered; use Connect instead")
 
 	ErrNoPushName = errors.New("can't send presence without PushName set")
 

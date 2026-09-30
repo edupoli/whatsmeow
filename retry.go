@@ -521,19 +521,24 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 	if retryCount > 1 || forceIncludeIdentity {
 		if key, err := cli.Store.PreKeys.GenOnePreKey(ctx); err != nil {
 			cli.Log.Errorf("Failed to get prekey for retry receipt: %v", err)
-		} else if deviceIdentity, err := proto.Marshal(cli.Store.Account); err != nil {
-			cli.Log.Errorf("Failed to marshal account info: %v", err)
-			return
 		} else {
+			keyNodes := []waBinary.Node{
+				{Tag: "type", Content: []byte{ecc.DjbType}},
+				{Tag: "identity", Content: cli.Store.IdentityKey.Pub[:]},
+				preKeyToNode(key),
+				preKeyToNode(cli.Store.SignedPreKey),
+			}
+			if !cli.Store.Mobile {
+				deviceIdentity, err := proto.Marshal(cli.Store.Account)
+				if err != nil {
+					cli.Log.Errorf("Failed to marshal account info: %v", err)
+					return
+				}
+				keyNodes = append(keyNodes, waBinary.Node{Tag: "device-identity", Content: deviceIdentity})
+			}
 			payload.Content = append(payload.GetChildren(), waBinary.Node{
-				Tag: "keys",
-				Content: []waBinary.Node{
-					{Tag: "type", Content: []byte{ecc.DjbType}},
-					{Tag: "identity", Content: cli.Store.IdentityKey.Pub[:]},
-					preKeyToNode(key),
-					preKeyToNode(cli.Store.SignedPreKey),
-					{Tag: "device-identity", Content: deviceIdentity},
-				},
+				Tag:     "keys",
+				Content: keyNodes,
 			})
 		}
 	}

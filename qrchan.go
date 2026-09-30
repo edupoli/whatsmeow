@@ -221,6 +221,8 @@ func (qrc *qrChannel) handleEvent(rawEvt any) {
 func (cli *Client) GetQRChannel(ctx context.Context) (<-chan QRChannelItem, error) {
 	if cli == nil {
 		return nil, ErrClientIsNil
+	} else if cli.Store.Mobile {
+		return nil, ErrMobileCannotPair
 	} else if cli.IsConnected() {
 		return nil, ErrQRAlreadyConnected
 	} else if cli.Store.ID != nil {

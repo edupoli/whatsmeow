@@ -82,7 +82,12 @@ func (cli *Client) doHandshake(fs *socket.FrameSocket, ephemeralKP keys.KeyPair)
 	certDecrypted, err := nh.Decrypt(certificateCiphertext)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt noise certificate ciphertext: %w", err)
-	} else if err = verifyServerCert(certDecrypted, staticDecrypted); err != nil {
+	} else if cli.Store.Mobile {
+		err = verifyMobileServerCert(certDecrypted, staticDecrypted)
+	} else {
+		err = verifyServerCert(certDecrypted, staticDecrypted)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("failed to verify server cert: %w", err)
 	}
 
@@ -130,6 +135,27 @@ func (cli *Client) doHandshake(fs *socket.FrameSocket, ephemeralKP keys.KeyPair)
 	cli.socket = ns
 
 	return queue, nil
+}
+
+func verifyMobileServerCert(raw, static []byte) error {
+	var cert waCert.CertChain_NoiseCertificate
+	if err := proto.Unmarshal(raw, &cert); err != nil {
+		return err
+	}
+	if len(cert.GetDetails()) == 0 || len(cert.GetSignature()) != 64 {
+		return verifyServerCert(raw, static)
+	}
+	if !ecc.VerifySignature(ecc.NewDjbECPublicKey(WACertPubKey), cert.Details, [64]byte(cert.Signature)) {
+		return fmt.Errorf("invalid mobile Noise certificate signature")
+	}
+	var details waCert.CertChain_NoiseCertificate_Details
+	if err := proto.Unmarshal(cert.Details, &details); err != nil {
+		return err
+	}
+	if !hmac.Equal(details.GetKey(), static) {
+		return fmt.Errorf("mobile Noise certificate key mismatch")
+	}
+	return checkCertValidity(&details)
 }
 
 func checkCertValidity(cert *waCert.CertChain_NoiseCertificate_Details) error {

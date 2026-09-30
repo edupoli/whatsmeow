@@ -7,6 +7,7 @@
 package sqlstore
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -116,7 +117,8 @@ const getAllDevicesQuery = `
 SELECT jid, lid, registration_id, noise_key, identity_key,
        signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
        adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig,
-       platform, business_name, push_name, facebook_uuid, lid_migration_ts, companion_meta_nonce
+       platform, business_name, push_name, facebook_uuid, lid_migration_ts, companion_meta_nonce,
+       mobile, mobile_version, mobile_phone_id, mobile_os_version, mobile_model
 FROM whatsmeow_device
 `
 
@@ -134,7 +136,8 @@ func (c *Container) scanDevice(row dbutil.Scannable) (*store.Device, error) {
 		&device.ID, &device.LID, &device.RegistrationID, &noisePriv, &identityPriv,
 		&preKeyPriv, &device.SignedPreKey.KeyID, &preKeySig,
 		&device.AdvSecretKey, &account.Details, &account.AccountSignature, &account.AccountSignatureKey, &account.DeviceSignature,
-		&device.Platform, &device.BusinessName, &device.PushName, &fbUUID, &device.LIDMigrationTimestamp, &device.CompanionMetaNonce)
+		&device.Platform, &device.BusinessName, &device.PushName, &fbUUID, &device.LIDMigrationTimestamp, &device.CompanionMetaNonce,
+		&device.Mobile, &device.MobileVersion, &device.MobilePhoneID, &device.MobileOSVersion, &device.MobileModel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan session: %w", err)
 	} else if len(noisePriv) != 32 || len(identityPriv) != 32 || len(preKeyPriv) != 32 || len(preKeySig) != 64 {
@@ -145,7 +148,9 @@ func (c *Container) scanDevice(row dbutil.Scannable) (*store.Device, error) {
 	device.IdentityKey = keys.NewKeyPairFromPrivateKey(*(*[32]byte)(identityPriv))
 	device.SignedPreKey.KeyPair = *keys.NewKeyPairFromPrivateKey(*(*[32]byte)(preKeyPriv))
 	device.SignedPreKey.Signature = (*[64]byte)(preKeySig)
-	device.Account = &account
+	if !device.Mobile {
+		device.Account = &account
+	}
 	device.FacebookUUID = fbUUID.UUID
 
 	c.initializeDevice(&device)
@@ -192,15 +197,22 @@ const (
 		INSERT INTO whatsmeow_device (jid, lid, registration_id, noise_key, identity_key,
 									  signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
 									  adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig,
-									  platform, business_name, push_name, facebook_uuid, lid_migration_ts, companion_meta_nonce)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+									  platform, business_name, push_name, facebook_uuid, lid_migration_ts, companion_meta_nonce,
+									  mobile, mobile_version, mobile_phone_id, mobile_os_version, mobile_model)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 		ON CONFLICT (jid) DO UPDATE
 			SET lid=excluded.lid,
 				platform=excluded.platform,
 				business_name=excluded.business_name,
 				push_name=excluded.push_name,
 				lid_migration_ts=excluded.lid_migration_ts,
-				companion_meta_nonce=excluded.companion_meta_nonce
+				companion_meta_nonce=excluded.companion_meta_nonce,
+				mobile=excluded.mobile,
+				mobile_version=excluded.mobile_version,
+				mobile_phone_id=excluded.mobile_phone_id,
+				mobile_os_version=excluded.mobile_os_version,
+				mobile_model=excluded.mobile_model
+			WHERE whatsmeow_device.noise_key=excluded.noise_key
 	`
 	deleteDeviceQuery = `DELETE FROM whatsmeow_device WHERE jid=$1`
 )
@@ -223,6 +235,42 @@ func (c *Container) NewDevice() *store.Device {
 	return device
 }
 
+// PutPendingMobileRegistration saves the keys and identifiers before /code is
+// requested. The caller is responsible for protecting this private-key blob.
+func (c *Container) PutPendingMobileRegistration(ctx context.Context, phone string, snapshot []byte) error {
+	if phone == "" || len(snapshot) == 0 {
+		return errors.New("empty mobile registration")
+	}
+	result, err := c.db.Exec(ctx, `INSERT INTO whatsmeow_mobile_pending (phone, snapshot) VALUES ($1, $2)
+		ON CONFLICT (phone) DO NOTHING`, phone, snapshot)
+	if err != nil {
+		return err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil || inserted > 0 {
+		return err
+	}
+	stored, err := c.GetPendingMobileRegistration(ctx, phone)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(stored, snapshot) {
+		return errors.New("pending registration already exists: restore its original keys")
+	}
+	return nil
+}
+
+func (c *Container) GetPendingMobileRegistration(ctx context.Context, phone string) ([]byte, error) {
+	var snapshot []byte
+	err := c.db.QueryRow(ctx, `SELECT snapshot FROM whatsmeow_mobile_pending WHERE phone=$1`, phone).Scan(&snapshot)
+	return snapshot, err
+}
+
+func (c *Container) DeletePendingMobileRegistration(ctx context.Context, phone string) error {
+	_, err := c.db.Exec(ctx, `DELETE FROM whatsmeow_mobile_pending WHERE phone=$1`, phone)
+	return err
+}
+
 // ErrDeviceIDMustBeSet is the error returned by PutDevice if you try to save a device before knowing its JID.
 var ErrDeviceIDMustBeSet = errors.New("device JID must be known before accessing database")
 
@@ -240,15 +288,40 @@ func (c *Container) PutDevice(ctx context.Context, device *store.Device) error {
 	if device.ID == nil {
 		return ErrDeviceIDMustBeSet
 	}
-	_, err := c.db.Exec(ctx, insertDeviceQuery,
+	if device.Mobile && !device.Initialized {
+		existing, err := c.GetDevice(ctx, *device.ID)
+		if err != nil {
+			return err
+		}
+		if existing != nil && (!existing.Mobile || !bytes.Equal(existing.NoiseKey.Priv[:], device.NoiseKey.Priv[:])) {
+			return errors.New("mobile registration JID already belongs to a different device")
+		}
+	}
+	account := device.Account
+	if account == nil {
+		if !device.Mobile {
+			return errors.New("web device has no paired account identity")
+		}
+		// Primary devices have no companion ADV. The fixed-size zeroes are DB-only
+		// placeholders for the existing non-null Web columns, never sent on the wire.
+		account = &waAdv.ADVSignedDeviceIdentity{Details: []byte{}, AccountSignature: make([]byte, 64), AccountSignatureKey: make([]byte, 32), DeviceSignature: make([]byte, 64)}
+	}
+	result, err := c.db.Exec(ctx, insertDeviceQuery,
 		device.ID, device.LID, device.RegistrationID, device.NoiseKey.Priv[:], device.IdentityKey.Priv[:],
 		device.SignedPreKey.Priv[:], device.SignedPreKey.KeyID, device.SignedPreKey.Signature[:],
-		device.AdvSecretKey, device.Account.Details, device.Account.AccountSignature, device.Account.AccountSignatureKey, device.Account.DeviceSignature,
+		device.AdvSecretKey, account.Details, account.AccountSignature, account.AccountSignatureKey, account.DeviceSignature,
 		device.Platform, device.BusinessName, device.PushName, uuid.NullUUID{UUID: device.FacebookUUID, Valid: device.FacebookUUID != uuid.Nil},
-		device.LIDMigrationTimestamp, device.CompanionMetaNonce,
+		device.LIDMigrationTimestamp, device.CompanionMetaNonce, device.Mobile, device.MobileVersion, device.MobilePhoneID, device.MobileOSVersion, device.MobileModel,
 	)
+	if err == nil {
+		var affected int64
+		affected, err = result.RowsAffected()
+		if err == nil && affected == 0 {
+			err = errors.New("device JID already belongs to a different identity")
+		}
+	}
 
-	if !device.Initialized {
+	if err == nil && !device.Initialized {
 		c.initializeDevice(device)
 	}
 	return err

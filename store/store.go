@@ -219,11 +219,16 @@ type AllStores interface {
 type Device struct {
 	Log waLog.Logger
 
-	NoiseKey       *keys.KeyPair
-	IdentityKey    *keys.KeyPair
-	SignedPreKey   *keys.PreKey
-	RegistrationID uint32
-	AdvSecretKey   []byte
+	NoiseKey        *keys.KeyPair
+	IdentityKey     *keys.KeyPair
+	SignedPreKey    *keys.PreKey
+	RegistrationID  uint32
+	AdvSecretKey    []byte
+	Mobile          bool
+	MobileVersion   string
+	MobilePhoneID   string
+	MobileOSVersion string
+	MobileModel     string
 
 	ID  *types.JID
 	LID types.JID

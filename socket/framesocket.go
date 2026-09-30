@@ -7,10 +7,14 @@
 package socket
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -20,12 +24,14 @@ import (
 )
 
 type FrameSocket struct {
-	parentCtx context.Context
-	cancelCtx context.Context
-	cancel    context.CancelFunc
-	conn      atomic.Pointer[websocket.Conn]
-	log       waLog.Logger
-	lock      sync.Mutex
+	parentCtx  context.Context
+	cancelCtx  context.Context
+	cancel     context.CancelFunc
+	conn       atomic.Pointer[websocket.Conn]
+	mobileConn atomic.Pointer[mobileConnection]
+	log        waLog.Logger
+	lock       sync.Mutex
+	sendLock   sync.Mutex
 
 	URL         string
 	HTTPHeaders http.Header
@@ -44,6 +50,8 @@ type FrameSocket struct {
 	partialHeader  []byte
 }
 
+type mobileConnection struct{ net.Conn }
+
 func NewFrameSocket(log waLog.Logger, client *http.Client) *FrameSocket {
 	return &FrameSocket{
 		log:    log,
@@ -61,7 +69,7 @@ func NewFrameSocket(log waLog.Logger, client *http.Client) *FrameSocket {
 }
 
 func (fs *FrameSocket) IsConnected() bool {
-	return fs.conn.Load() != nil
+	return fs.conn.Load() != nil || fs.mobileConn.Load() != nil
 }
 
 func (fs *FrameSocket) Close(code websocket.StatusCode) {
@@ -69,21 +77,24 @@ func (fs *FrameSocket) Close(code websocket.StatusCode) {
 	defer fs.lock.Unlock()
 
 	conn := fs.conn.Swap(nil)
+	mobile := fs.mobileConn.Swap(nil)
 	if conn == nil {
-		return
-	}
-
-	fs.closed.Store(true)
-	if code > 0 {
-		err := conn.Close(code, "")
-		if err != nil {
-			fs.log.Warnf("Error sending close to websocket: %v", err)
+		if mobile == nil {
+			return
 		}
 	} else {
-		err := conn.CloseNow()
-		if err != nil {
-			fs.log.Debugf("Error force closing websocket: %v", err)
+		if code > 0 {
+			err := conn.Close(code, "")
+			if err != nil {
+				fs.log.Warnf("Error closing websocket: %v", err)
+			}
+		} else {
+			_ = conn.CloseNow()
 		}
+	}
+	fs.closed.Store(true)
+	if mobile != nil {
+		_ = mobile.Close()
 	}
 	fs.cancel()
 	fs.cancel = nil
@@ -95,11 +106,21 @@ func (fs *FrameSocket) Close(code websocket.StatusCode) {
 func (fs *FrameSocket) Connect(ctx context.Context) error {
 	fs.lock.Lock()
 	defer fs.lock.Unlock()
-	if fs.conn.Load() != nil {
+	if fs.IsConnected() {
 		return ErrSocketAlreadyOpen
 	}
 	fs.parentCtx = ctx
 	fs.cancelCtx, fs.cancel = context.WithCancel(ctx)
+	if strings.HasPrefix(fs.URL, "tcp://") {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", strings.TrimPrefix(fs.URL, "tcp://"))
+		if err != nil {
+			fs.cancel()
+			return fmt.Errorf("%w: %w", ErrDialFailed, err)
+		}
+		fs.mobileConn.Store(&mobileConnection{conn})
+		go fs.readMobile(conn, ctx)
+		return nil
+	}
 
 	fs.log.Debugf("Dialing %s", fs.URL)
 	conn, resp, err := websocket.Dial(ctx, fs.URL, fs.makeDialOptions())
@@ -123,8 +144,11 @@ func (fs *FrameSocket) Context() context.Context {
 }
 
 func (fs *FrameSocket) SendFrame(data []byte) error {
+	fs.sendLock.Lock()
+	defer fs.sendLock.Unlock()
 	conn := fs.conn.Load()
-	if conn == nil {
+	mobile := fs.mobileConn.Load()
+	if conn == nil && mobile == nil {
 		return ErrSocketClosed
 	}
 	dataLength := len(data)
@@ -151,7 +175,28 @@ func (fs *FrameSocket) SendFrame(data []byte) error {
 	// Copy actual frame data
 	copy(wholeFrame[headerLength+FrameLengthSize:], data)
 
+	if mobile != nil {
+		_, err := io.Copy(mobile.Conn, bytes.NewReader(wholeFrame))
+		return err
+	}
 	return conn.Write(fs.cancelCtx, websocket.MessageBinary, wholeFrame)
+}
+
+func (fs *FrameSocket) readMobile(conn net.Conn, ctx context.Context) {
+	defer func() { go fs.Close(0) }()
+	buffer := make([]byte, 64*1024)
+	for {
+		n, err := conn.Read(buffer)
+		if n > 0 {
+			fs.processData(buffer[:n])
+		}
+		if err != nil {
+			if !fs.closed.Load() && ctx.Err() == nil {
+				fs.log.Errorf("Error reading mobile socket: %v", err)
+			}
+			return
+		}
+	}
 }
 
 func (fs *FrameSocket) frameComplete() {
@@ -174,8 +219,8 @@ func (fs *FrameSocket) processData(msg []byte) {
 			if len(msg) >= FrameLengthSize {
 				length := (int(msg[0]) << 16) + (int(msg[1]) << 8) + int(msg[2])
 				fs.incomingLength = length
-				fs.receivedLength = len(msg)
 				msg = msg[FrameLengthSize:]
+				fs.receivedLength = len(msg)
 				if len(msg) >= length {
 					fs.incoming = msg[:length]
 					msg = msg[length:]
@@ -187,7 +232,7 @@ func (fs *FrameSocket) processData(msg []byte) {
 				}
 			} else {
 				fs.log.Warnf("Received partial header (report if this happens often)")
-				fs.partialHeader = msg
+				fs.partialHeader = append([]byte(nil), msg...)
 				msg = nil
 			}
 		} else {

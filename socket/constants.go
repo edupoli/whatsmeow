@@ -26,10 +26,15 @@ const (
 const (
 	NoiseStartPattern = "Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00"
 
-	WAMagicValue = 6
+	WAMagicValue       = 6
+	WAMobileMagicValue = 5
 )
 
 var WAConnHeader = []byte{'W', 'A', WAMagicValue, token.DictVersion}
+
+// WAMobileConnHeader is the mobile-style Noise prologue. Like Cobalt, it reuses
+// the current binary token dictionary version rather than a historical constant.
+var WAMobileConnHeader = []byte{'W', 'A', WAMobileMagicValue, token.DictVersion}
 
 const (
 	FrameMaxSize    = 1 << 24

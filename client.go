@@ -66,6 +66,9 @@ type Client struct {
 	recvLog waLog.Logger
 	sendLog waLog.Logger
 
+	// mobileRegistration holds the state between RequestMobileCode and RegisterMobile.
+	mobileRegistration *MobileRegistration
+
 	socket           *socket.NoiseSocket
 	socketLock       sync.RWMutex
 	socketWait       chan struct{}
@@ -548,6 +551,9 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 	if cli.Store.Deleted {
 		return store.ErrDeviceDeleted
 	}
+	if cli.Store.Mobile && cli.Store.ID == nil {
+		return fmt.Errorf("mobile device must complete phone registration before connecting")
+	}
 	if cli.socket != nil {
 		if !cli.socket.IsConnected() {
 			cli.unlockedDisconnect()
@@ -562,6 +568,10 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 		client = cli.preLoginHTTP
 	}
 	fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), client)
+	if cli.Store.Mobile {
+		fs.URL = "tcp://g.whatsapp.net:443"
+		fs.Header = socket.WAMobileConnHeader
+	}
 	if userAgent := cli.getUserAgent(); userAgent != "" {
 		fs.HTTPHeaders.Set("User-Agent", userAgent)
 	}
