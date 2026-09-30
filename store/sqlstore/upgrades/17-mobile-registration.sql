@@ -1,4 +1,4 @@
--- v16: Primary device metadata and resumable registration attempts.
+-- v17: Primary device metadata and resumable registration attempts.
 ALTER TABLE whatsmeow_device ADD COLUMN mobile BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE whatsmeow_device ADD COLUMN mobile_version TEXT NOT NULL DEFAULT '';
 ALTER TABLE whatsmeow_device ADD COLUMN mobile_phone_id TEXT NOT NULL DEFAULT '';
