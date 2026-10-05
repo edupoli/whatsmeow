@@ -8,7 +8,6 @@ package store
 
 import (
 	"crypto/md5"
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"strconv"
@@ -190,6 +189,9 @@ func (device *Device) getRegistrationPayload() *waWa6.ClientPayload {
 
 func (device *Device) getLoginPayload() *waWa6.ClientPayload {
 	payload := proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
+	if device.Mobile {
+		return device.getMobileLoginPayload(payload)
+	}
 	payload.Username = proto.Uint64(device.ID.UserInt())
 	payload.Device = proto.Uint32(uint32(device.ID.Device))
 	payload.Passive = proto.Bool(true)
@@ -201,56 +203,58 @@ func (device *Device) getLoginPayload() *waWa6.ClientPayload {
 	return payload
 }
 
-func (device *Device) getMobileLoginPayload() *waWa6.ClientPayload {
-	if device.ID == nil || device.MobileVersion == "" {
-		return nil
-	}
-	versionParts := strings.Split(device.MobileVersion, ".")
-	if len(versionParts) != 4 {
-		return nil
-	}
-	version := make([]uint32, 4)
-	for i, part := range versionParts {
-		value, err := strconv.ParseUint(part, 10, 32)
-		if err != nil {
-			return nil
-		}
-		version[i] = uint32(value)
-	}
-	payload := proto.Clone(BaseClientPayload).(*waWa6.ClientPayload)
-	var sessionID [4]byte
-	if _, err := rand.Read(sessionID[:]); err != nil {
-		return nil
-	}
-	payload.SessionID = proto.Int32(int32(binary.BigEndian.Uint32(sessionID[:]) & 0x3fffffff))
-	payload.WebInfo = nil
-	payload.DevicePairingData = nil
+// getMobileLoginPayload converts the web payload into the Android payload that a
+// primary (phone) device must send, so the Noise login matches the registration.
+func (device *Device) getMobileLoginPayload(payload *waWa6.ClientPayload) *waWa6.ClientPayload {
 	payload.Username = proto.Uint64(device.ID.UserInt())
+	// Phones are always the primary device.
 	payload.Device = proto.Uint32(0)
 	payload.Passive = proto.Bool(false)
-	payload.PushName = proto.String(device.PushName)
-	payload.ShortConnect = proto.Bool(true)
-	payload.ConnectAttemptCount = proto.Uint32(0)
-	payload.Oc = proto.Bool(false)
-	payload.UserAgent.Platform = waWa6.ClientPayload_UserAgent_IOS.Enum()
-	payload.UserAgent.AppVersion = &waWa6.ClientPayload_UserAgent_AppVersion{
-		Primary: &version[0], Secondary: &version[1], Tertiary: &version[2], Quaternary: &version[3],
+	payload.Pull = proto.Bool(true)
+	payload.LidDbMigrated = proto.Bool(true)
+	if payload.Lc == nil {
+		payload.Lc = proto.Int32(1)
 	}
+
+	payload.UserAgent.Platform = waWa6.ClientPayload_UserAgent_ANDROID.Enum()
+	payload.UserAgent.ReleaseChannel = waWa6.ClientPayload_UserAgent_RELEASE.Enum()
+	// Android versions have four parts; the last one is the build/codename hash.
+	if parts := strings.Split(device.MobileVersion, "."); len(parts) == 4 {
+		var nums [4]uint64
+		ok := true
+		for i, p := range parts {
+			v, err := strconv.ParseUint(p, 10, 64)
+			if err != nil {
+				ok = false
+				break
+			}
+			nums[i] = v
+		}
+		if ok {
+			payload.UserAgent.AppVersion.Primary = proto.Uint32(uint32(nums[0]))
+			payload.UserAgent.AppVersion.Secondary = proto.Uint32(uint32(nums[1]))
+			payload.UserAgent.AppVersion.Tertiary = proto.Uint32(uint32(nums[2]))
+			payload.UserAgent.AppVersion.Quaternary = proto.Uint32(uint32(nums[3]))
+		}
+	}
+	payload.UserAgent.OsVersion = proto.String(device.MobileOSVersion)
+	payload.UserAgent.Manufacturer = proto.String(device.MobileManufacturer)
+	payload.UserAgent.Device = proto.String(device.MobileModel)
+	payload.UserAgent.PhoneID = proto.String(device.MobilePhoneID)
 	payload.UserAgent.Mcc = proto.String("000")
 	payload.UserAgent.Mnc = proto.String("000")
-	payload.UserAgent.OsVersion = proto.String(device.MobileOSVersion)
 	payload.UserAgent.OsBuildNumber = proto.String(device.MobileOSVersion)
-	payload.UserAgent.Manufacturer = proto.String("Apple")
-	payload.UserAgent.Device = proto.String(strings.ReplaceAll(device.MobileModel, "_", " "))
-	payload.UserAgent.PhoneID = proto.String(device.MobilePhoneID)
-	payload.UserAgent.DeviceType = waWa6.ClientPayload_UserAgent_PHONE.Enum()
-	payload.UserAgent.DeviceModelType = proto.String(strings.TrimPrefix(device.MobileModel, "Apple-"))
+	// Web-only features that phones don't support.
+	payload.WebInfo = nil
+	payload.PushName = proto.String(device.PushName)
+	payload.ConnectType = waWa6.ClientPayload_CELLULAR_UNKNOWN.Enum()
+	payload.ConnectReason = waWa6.ClientPayload_PUSH.Enum()
 	return payload
 }
 
 func (device *Device) GetClientPayload() *waWa6.ClientPayload {
-	if device.Mobile {
-		return device.getMobileLoginPayload()
+	if device.Mobile && device.ID == nil {
+		return nil
 	}
 	if device.ID != nil {
 		if *device.ID == types.EmptyJID {

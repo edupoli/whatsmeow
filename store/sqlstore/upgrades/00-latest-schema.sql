@@ -1,4 +1,4 @@
--- v0 -> v16 (compatible with v8+): Latest schema
+-- v0 -> v18 (compatible with v8+): Latest schema
 CREATE TABLE whatsmeow_device (
 	jid TEXT PRIMARY KEY,
 	lid TEXT,
@@ -26,7 +26,14 @@ CREATE TABLE whatsmeow_device (
 
 	lid_migration_ts BIGINT NOT NULL DEFAULT 0,
 
-	companion_meta_nonce TEXT NOT NULL DEFAULT ''
+	companion_meta_nonce TEXT NOT NULL DEFAULT '',
+
+	mobile              BOOLEAN NOT NULL DEFAULT FALSE,
+	mobile_version      TEXT NOT NULL DEFAULT '',
+	mobile_phone_id     TEXT NOT NULL DEFAULT '',
+	mobile_os_version   TEXT NOT NULL DEFAULT '',
+	mobile_model        TEXT NOT NULL DEFAULT '',
+	mobile_manufacturer TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE whatsmeow_identity_keys (
@@ -181,3 +188,8 @@ CREATE TABLE whatsmeow_retry_buffer (
 );
 
 CREATE INDEX whatsmeow_retry_buffer_timestamp_idx ON whatsmeow_retry_buffer (our_jid, timestamp);
+
+CREATE TABLE whatsmeow_mobile_pending (
+    phone TEXT PRIMARY KEY,
+    snapshot bytea NOT NULL
+);

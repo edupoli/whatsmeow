@@ -16,12 +16,14 @@ import (
 
 // Miscellaneous errors
 var (
-	ErrClientIsNil     = errors.New("client is nil")
-	ErrNoSession       = errors.New("can't encrypt message for device: no signal session established")
-	ErrIQTimedOut      = errors.New("info query timed out")
-	ErrNotConnected    = errors.New("websocket not connected")
-	ErrNotLoggedIn     = errors.New("the store doesn't contain a device JID")
-	ErrMessageTimedOut = errors.New("timed out waiting for message send response")
+	ErrClientIsNil             = errors.New("client is nil")
+	ErrNoSession               = errors.New("can't encrypt message for device: no signal session established")
+	ErrIQTimedOut              = errors.New("info query timed out")
+	ErrNotConnected            = errors.New("websocket not connected")
+	ErrNotLoggedIn             = errors.New("the store doesn't contain a device JID")
+	ErrMessageTimedOut         = errors.New("timed out waiting for message send response")
+	ErrMobileAlreadyRegistered = errors.New("device already registered; cannot start mobile registration")
+	ErrMobileAlreadyPending    = errors.New("a pending mobile registration already exists for this number; use ResumeMobileRegistration")
 
 	ErrAlreadyConnected = errors.New("websocket is already connected")
 
@@ -31,7 +33,6 @@ var (
 	ErrQRAlreadyConnected = errors.New("GetQRChannel must be called before connecting")
 	ErrQRStoreContainsID  = errors.New("GetQRChannel can only be called when there's no user ID in the client's Store")
 	ErrMobileCannotPair   = errors.New("mobile primary devices register with a phone number, not companion pairing")
-	ErrMobileAlreadyRegistered = errors.New("client is already registered; use Connect instead")
 
 	ErrNoPushName = errors.New("can't send presence without PushName set")
 

@@ -9,6 +9,7 @@ package whatsmeow
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"net/url"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,9 +67,6 @@ type Client struct {
 	Log     waLog.Logger
 	recvLog waLog.Logger
 	sendLog waLog.Logger
-
-	// mobileRegistration holds the state between RequestMobileCode and RegisterMobile.
-	mobileRegistration *MobileRegistration
 
 	socket           *socket.NoiseSocket
 	socketLock       sync.RWMutex
@@ -169,6 +168,15 @@ type Client struct {
 	// even if the process is restarted? If false, only the in-memory cache and GetMessageForRetry will be used.
 	UseRetryMessageStore bool
 	lastRetryStoreClear  time.Time
+
+	// Mobile registration state (primary device via SMS/code)
+	mobileRegistrationLock     sync.Mutex
+	mobileRegistration         *MobileRegistrationClient
+	mobileP256PrivateKey       *ecdsa.PrivateKey
+	mobileRegistrationEndpoint string
+
+	// MobileProfile overrides the device identity sent during registration.
+	MobileProfile MobileProfileConfig
 
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
 	// the client will disconnect.
@@ -568,10 +576,6 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 		client = cli.preLoginHTTP
 	}
 	fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), client)
-	if cli.Store.Mobile {
-		fs.URL = "tcp://g.whatsapp.net:443"
-		fs.Header = socket.WAMobileConnHeader
-	}
 	if userAgent := cli.getUserAgent(); userAgent != "" {
 		fs.HTTPHeaders.Set("User-Agent", userAgent)
 	}
@@ -579,8 +583,12 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 		fs.URL = cli.MessengerConfig.WebsocketURL
 		fs.HTTPHeaders.Set("Origin", cli.MessengerConfig.BaseURL)
 	}
-	var queue chan *waBinary.Node
+	if cli.Store.Mobile {
+		fs.URL = "tcp://g.whatsapp.net:443"
+		fs.Header = socket.WAMobileConnHeader
+	}
 	maps.Copy(fs.HTTPHeaders, cli.WebSocketHeaders)
+	var queue chan *waBinary.Node
 	if err := fs.Connect(ctx); err != nil {
 		fs.Close(0)
 		return err
@@ -1121,4 +1129,405 @@ func (cli *Client) sendUnifiedSession() {
 	if err != nil {
 		cli.Log.Debugf("Failed to send unified_session telemetry: %v", err)
 	}
+}
+
+// SetMobileRegistrationEndpoint overrides the registration endpoint.
+// This should only be used in tests.
+func (cli *Client) SetMobileRegistrationEndpoint(endpoint string) {
+	cli.mobileRegistrationLock.Lock()
+	defer cli.mobileRegistrationLock.Unlock()
+	cli.mobileRegistrationEndpoint = endpoint
+	if cli.mobileRegistration != nil {
+		cli.mobileRegistration.SetEndpoint(endpoint)
+	}
+}
+
+// RequestMobileCode starts primary device registration for a phone number.
+// It creates a registration identity, persists it to the store, checks eligibility via /exist,
+// and requests a verification code via /code. The code is delivered out-of-band (SMS, voice, email_otp, wa_old).
+// The method can be "sms", "voice", "email_otp", "wa_old", or empty to auto-select based on /exist.
+// Returns the server response with delivery method, length, and retry times.
+// The returned code must be passed to RegisterMobile to complete registration.
+func (cli *Client) RequestMobileCode(ctx context.Context, phone, method string) (*MobileRegistrationResponse, error) {
+	if cli == nil {
+		return nil, ErrClientIsNil
+	}
+	if !cli.mobileRegistrationLock.TryLock() {
+		return nil, errors.New("mobile registration already in progress")
+	}
+	defer cli.mobileRegistrationLock.Unlock()
+
+	if cli.Store == nil || cli.Store.Container == nil {
+		return nil, errors.New("device store does not support mobile registration persistence")
+	}
+	if cli.Store.ID != nil {
+		return nil, ErrMobileAlreadyRegistered
+	}
+
+	cc, national, err := splitMobileNumber(phone)
+	if err != nil {
+		return nil, err
+	}
+	phoneNorm := cc + national
+
+	pendingStore, ok := cli.Store.Container.(store.DeviceContainer)
+	if !ok {
+		return nil, errors.New("device store does not support mobile registration persistence")
+	}
+	if pending, _ := pendingStore.GetPendingMobileRegistration(ctx, phoneNorm); pending != nil {
+		return nil, ErrMobileAlreadyPending
+	}
+
+	// Generate registration state (includes the P-256 key used to sign H).
+	profile := cli.MobileProfile
+	if profile.Version == "" {
+		profile = DefaultMobileProfile()
+	}
+	state, err := GenerateMobileRegistrationState(cc, national, profile.Version, profile.OSVersion, profile.Model, profile.Manufacturer)
+	if err != nil {
+		return nil, err
+	}
+	state.LocaleLanguage, state.LocaleCountry, state.SIMMCC, state.SIMMNC = resolveMobileLocale(
+		cc, profile.LocaleLanguage, profile.LocaleCountry, profile.SIMMCC, profile.SIMMNC)
+	cli.Log.Infof("Mobile profile: %s %s (%s/%s) %s, cc=%s sim=%s/%s",
+		state.Manufacturer, state.Model, state.Version, state.OSVersion, state.LocaleCountry,
+		cc, state.SIMMCC, state.SIMMNC)
+	p256Priv, err := state.P256Signer()
+	if err != nil {
+		return nil, err
+	}
+	cli.mobileP256PrivateKey = p256Priv
+
+	// Persist snapshot BEFORE any network request
+	snapshot, err := state.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	if err = pendingStore.PutPendingMobileRegistration(ctx, phoneNorm, snapshot); err != nil {
+		return nil, err
+	}
+	// The row means "an OTP is on its way". Nothing between here and a sent code
+	// makes that true, and a row left behind by a refused /code would tell the next
+	// run to resume an attempt the server never accepted.
+	codeSent := false
+	defer func() {
+		if !codeSent {
+			_ = pendingStore.DeletePendingMobileRegistration(ctx, phoneNorm)
+		}
+	}()
+
+	// Create client and do /exist
+	client := NewMobileRegistrationClient(state, cli.mobileP256PrivateKey)
+	client.HTTPClient = cli.preLoginHTTP
+	if cli.mobileRegistrationEndpoint != "" {
+		client.SetEndpoint(cli.mobileRegistrationEndpoint)
+	}
+
+	// The official app walks the onboarding funnel before /exist, and the server
+	// expects to have seen those requests.
+	if err = client.RunOnboardingFunnel(ctx); err != nil {
+		cli.Log.Warnf("Mobile onboarding funnel failed: %v", err)
+	}
+
+	existResp, err := client.CheckExists(ctx)
+	if err != nil {
+		return existResp, err
+	}
+
+	// Method selection: an explicit choice wins, otherwise the eligibility flags
+	// decide. All-zero flags are normal for a number the server has not seen, and
+	// /code still answers status=sent in that case, so don't refuse here.
+	m := strings.TrimSpace(method)
+	if m == "" {
+		m = existResp.PickMethod()
+		if m == "" {
+			m = "sms"
+		}
+	}
+	method = m
+
+	// Request code
+	codeResp, err := client.RequestCode(ctx, method)
+	if err != nil {
+		return codeResp, err
+	}
+	codeSent = true
+
+	// Store the client for RegisterMobile
+	cli.mobileRegistration = client
+
+	cli.dispatchEvent(&events.MobileCodeRequested{
+		Phone:      phoneNorm,
+		Method:     codeResp.Method,
+		Length:     codeResp.Length,
+		RetryAfter: codeResp.RetryAfter,
+	})
+
+	return codeResp, nil
+}
+
+// ResumeMobileRegistration loads a pending registration from the store without making network requests.
+// Call this after restarting the app, then call RegisterMobile with the received OTP.
+// HTTP client, endpoint, and P-256 key must be configured before calling (they're not persisted).
+func (cli *Client) ResumeMobileRegistration(ctx context.Context, phone string) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	if !cli.mobileRegistrationLock.TryLock() {
+		return errors.New("mobile registration already in progress")
+	}
+	defer cli.mobileRegistrationLock.Unlock()
+
+	if cli.Store == nil || cli.Store.Container == nil {
+		return errors.New("device store does not support mobile registration")
+	}
+	if cli.Store.ID != nil {
+		return ErrMobileAlreadyRegistered
+	}
+	if cli.mobileRegistration != nil {
+		return errors.New("mobile registration already in progress")
+	}
+
+	cc, national, err := splitMobileNumber(phone)
+	if err != nil {
+		return err
+	}
+	phoneNorm := cc + national
+
+	pendingStore, ok := cli.Store.Container.(store.DeviceContainer)
+	if !ok {
+		return errors.New("device store does not support mobile registration persistence")
+	}
+	snapshot, err := pendingStore.GetPendingMobileRegistration(ctx, phoneNorm)
+	if err != nil {
+		return err
+	}
+	if snapshot == nil {
+		return errors.New("no pending mobile registration for this number")
+	}
+
+	state, err := RestoreMobileRegistrationState(snapshot)
+	if err != nil {
+		return err
+	}
+	if state.CountryCode+state.NationalNumber != phoneNorm {
+		return errors.New("pending registration phone mismatch")
+	}
+
+	// P-256 key is part of the persisted snapshot
+	p256Priv, err := state.P256Signer()
+	if err != nil {
+		return err
+	}
+	cli.mobileP256PrivateKey = p256Priv
+
+	client := NewMobileRegistrationClient(state, p256Priv)
+	client.HTTPClient = cli.preLoginHTTP
+	if cli.mobileRegistrationEndpoint != "" {
+		client.SetEndpoint(cli.mobileRegistrationEndpoint)
+	}
+	cli.mobileRegistration = client
+	return nil
+}
+
+// DiscardMobileRegistration throws away a pending attempt for a phone number, so
+// the next RequestMobileCode starts a new one with fresh keys.
+//
+// The pending row is what makes a second attempt with the same number fail with
+// ErrMobileAlreadyPending. It is worth keeping when an OTP is on its way, and
+// worth dropping when the attempt is dead: a number the server has blocked, a
+// delivery that never arrived, a build that no longer matches. Without this the
+// only way out is deleting the database and losing every other session in it.
+func (cli *Client) DiscardMobileRegistration(ctx context.Context, phone string) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	if !cli.mobileRegistrationLock.TryLock() {
+		return errors.New("mobile registration already in progress")
+	}
+	defer cli.mobileRegistrationLock.Unlock()
+
+	if cli.Store == nil || cli.Store.ID != nil {
+		return ErrMobileAlreadyRegistered
+	}
+	container, ok := cli.Store.Container.(store.DeviceContainer)
+	if !ok {
+		return errors.New("device store does not support mobile registration persistence")
+	}
+	cc, national, err := splitMobileNumber(phone)
+	if err != nil {
+		return err
+	}
+	if cli.mobileRegistration != nil &&
+		cli.mobileRegistration.State.CountryCode+cli.mobileRegistration.State.NationalNumber == cc+national {
+		cli.mobileRegistration = nil
+		cli.mobileP256PrivateKey = nil
+	}
+	return container.DeletePendingMobileRegistration(ctx, cc+national)
+}
+
+// RegisterMobile completes registration by verifying the OTP code via /register.
+// If the server responds with reason=consent, it automatically calls /consent.
+// If reason=security_code, call RegisterMobileTwoFactor with the PIN.
+// On success, the device is persisted and the client is ready for Connect().
+func (cli *Client) RegisterMobile(ctx context.Context, code string) (*MobileRegistrationResponse, error) {
+	return cli.registerMobile(ctx, code, false)
+}
+
+// RegisterMobileTwoFactor completes the security_code (2FA PIN) step.
+func (cli *Client) RegisterMobileTwoFactor(ctx context.Context, pin string) (*MobileRegistrationResponse, error) {
+	return cli.registerMobile(ctx, pin, true)
+}
+
+func (cli *Client) registerMobile(ctx context.Context, code string, twoFactor bool) (*MobileRegistrationResponse, error) {
+	if cli == nil {
+		return nil, ErrClientIsNil
+	}
+	if !cli.mobileRegistrationLock.TryLock() {
+		return nil, errors.New("mobile registration already in progress")
+	}
+	defer cli.mobileRegistrationLock.Unlock()
+
+	if cli.mobileRegistration == nil {
+		return nil, errors.New("no mobile registration in progress; call RequestMobileCode or ResumeMobileRegistration first")
+	}
+
+	client := cli.mobileRegistration
+	var resp *MobileRegistrationResponse
+	var err error
+
+	if twoFactor {
+		resp, err = client.ConfirmTwoFactorPIN(ctx, code)
+	} else {
+		resp, err = client.VerifyCode(ctx, code)
+		if err != nil {
+			var regErr *MobileRegistrationError
+			if errors.As(err, &regErr) && regErr.Response.Reason == "consent" {
+				// New account needs consent
+				resp, err = client.ConfirmConsent(ctx)
+			}
+		}
+	}
+	if err != nil {
+		return resp, err
+	}
+
+	// Success - promote device
+	phone := resp.Login
+	if phone == "" {
+		phone = cli.mobileRegistration.State.CountryCode + cli.mobileRegistration.State.NationalNumber
+	}
+	if !digits(phone) {
+		return resp, errors.New("invalid login from server")
+	}
+
+	advSecretKey := cli.Store.AdvSecretKey
+
+	jid := types.NewJID(phone, types.DefaultUserServer)
+
+	// Build Device from the registration state, reusing the exact keys that were
+	// sent to /register so the Noise handshake and Signal pre-keys match.
+	state := cli.mobileRegistration.State
+	device := &store.Device{
+		Log:                cli.Store.Log,
+		Container:          cli.Store.Container,
+		NoiseKey:           keys.NewKeyPairFromPrivateKey(state.NoisePrivate),
+		IdentityKey:        keys.NewKeyPairFromPrivateKey(state.IdentityPrivate),
+		SignedPreKey:       &keys.PreKey{KeyPair: *keys.NewKeyPairFromPrivateKey(state.SignedPreKeyPrivate), KeyID: state.SignedPreKeyID, Signature: &state.SignedPreKeySignature},
+		RegistrationID:     state.RegistrationID,
+		AdvSecretKey:       advSecretKey,
+		ID:                 &jid,
+		Mobile:             true,
+		MobileVersion:      state.Version,
+		MobilePhoneID:      state.PhoneID,
+		MobileOSVersion:    state.OSVersion,
+		MobileModel:        state.Model,
+		MobileManufacturer: state.Manufacturer,
+		Platform:           "android",
+		PushName:           "~",
+		// Account is required by PutDevice; the web flow receives it from the
+		// server during pairing, but /register doesn't send it, so build it here
+		// with the same primitives pair.go verifies.
+		Account: buildMobileADVIdentity(keys.NewKeyPairFromPrivateKey(state.IdentityPrivate)),
+	}
+
+	if err = device.Save(ctx); err != nil {
+		return resp, fmt.Errorf("registered phone but failed to persist mobile device: %w", err)
+	}
+
+	// Clean up pending registration
+	pendingStore := cli.Store.Container.(store.DeviceContainer)
+	if err = pendingStore.DeletePendingMobileRegistration(ctx, state.CountryCode+state.NationalNumber); err != nil {
+		return resp, fmt.Errorf("device registered but failed to remove pending registration: %w", err)
+	}
+
+	// Continue with the newly registered device instead of the pre-registration one.
+	cli.Store = device
+	cli.paired.Store(true)
+	cli.dispatchEvent(&events.MobileRegistered{
+		Phone: phone,
+		LID:   resp.LID,
+	})
+
+	return resp, nil
+}
+
+// MobileRegistrationStatus describes the saved state of a mobile registration attempt.
+type MobileRegistrationStatus struct {
+	Phone         string
+	CodeAttempted bool
+	Method        string
+	CodeRespAt    int64
+	ExistResponse *MobileRegistrationResponse
+	CodeResponse  *MobileRegistrationResponse
+	Registered    bool
+	LID           string
+}
+
+// GetMobileRegistrationStatus returns the saved state of a pending registration without making network requests.
+func (cli *Client) GetMobileRegistrationStatus(ctx context.Context, phone string) (*MobileRegistrationStatus, error) {
+	if cli == nil {
+		return nil, ErrClientIsNil
+	}
+	cc, national, err := splitMobileNumber(phone)
+	if err != nil {
+		return nil, err
+	}
+	phoneNorm := cc + national
+
+	pendingStore, ok := cli.Store.Container.(store.DeviceContainer)
+	if !ok {
+		return nil, errors.New("device store does not support mobile registration persistence")
+	}
+	snapshot, err := pendingStore.GetPendingMobileRegistration(ctx, phoneNorm)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot == nil {
+		return nil, nil
+	}
+
+	state, err := RestoreMobileRegistrationState(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	_ = state
+
+	return &MobileRegistrationStatus{
+		Phone: phoneNorm,
+		// Note: CodeAttempted/Method/CodeRespAt require the Android bridge to persist them.
+		// These fields are not yet implemented in the Go-only flow.
+	}, nil
+}
+
+func digits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }

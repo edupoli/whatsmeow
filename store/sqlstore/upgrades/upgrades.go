@@ -15,4 +15,6 @@ import (
 //go:embed *.sql
 var upgrades embed.FS
 
-var Table = dbutil.BuildUpgradeTable().WithFS(upgrades).Finish()
+var Table = dbutil.BuildUpgradeTable().WithFS(upgrades).
+	WithRaw(17, 18, 18, "Reconcile mobile device metadata", dbutil.TxnModeOn, upgradeMobileDevice).
+	Finish()

@@ -118,7 +118,7 @@ SELECT jid, lid, registration_id, noise_key, identity_key,
        signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
        adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig,
        platform, business_name, push_name, facebook_uuid, lid_migration_ts, companion_meta_nonce,
-       mobile, mobile_version, mobile_phone_id, mobile_os_version, mobile_model
+       mobile, mobile_version, mobile_phone_id, mobile_os_version, mobile_model, mobile_manufacturer
 FROM whatsmeow_device
 `
 
@@ -137,7 +137,7 @@ func (c *Container) scanDevice(row dbutil.Scannable) (*store.Device, error) {
 		&preKeyPriv, &device.SignedPreKey.KeyID, &preKeySig,
 		&device.AdvSecretKey, &account.Details, &account.AccountSignature, &account.AccountSignatureKey, &account.DeviceSignature,
 		&device.Platform, &device.BusinessName, &device.PushName, &fbUUID, &device.LIDMigrationTimestamp, &device.CompanionMetaNonce,
-		&device.Mobile, &device.MobileVersion, &device.MobilePhoneID, &device.MobileOSVersion, &device.MobileModel)
+		&device.Mobile, &device.MobileVersion, &device.MobilePhoneID, &device.MobileOSVersion, &device.MobileModel, &device.MobileManufacturer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan session: %w", err)
 	} else if len(noisePriv) != 32 || len(identityPriv) != 32 || len(preKeyPriv) != 32 || len(preKeySig) != 64 {
@@ -198,8 +198,9 @@ const (
 									  signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
 									  adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig,
 									  platform, business_name, push_name, facebook_uuid, lid_migration_ts, companion_meta_nonce,
-									  mobile, mobile_version, mobile_phone_id, mobile_os_version, mobile_model)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+									  mobile, mobile_version, mobile_phone_id, mobile_os_version, mobile_model, mobile_manufacturer)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+				$20, $21, $22, $23, $24, $25)
 		ON CONFLICT (jid) DO UPDATE
 			SET lid=excluded.lid,
 				platform=excluded.platform,
@@ -211,7 +212,8 @@ const (
 				mobile_version=excluded.mobile_version,
 				mobile_phone_id=excluded.mobile_phone_id,
 				mobile_os_version=excluded.mobile_os_version,
-				mobile_model=excluded.mobile_model
+				mobile_model=excluded.mobile_model,
+				mobile_manufacturer=excluded.mobile_manufacturer
 			WHERE whatsmeow_device.noise_key=excluded.noise_key
 	`
 	deleteDeviceQuery = `DELETE FROM whatsmeow_device WHERE jid=$1`
@@ -260,17 +262,6 @@ func (c *Container) PutPendingMobileRegistration(ctx context.Context, phone stri
 	return nil
 }
 
-func (c *Container) GetPendingMobileRegistration(ctx context.Context, phone string) ([]byte, error) {
-	var snapshot []byte
-	err := c.db.QueryRow(ctx, `SELECT snapshot FROM whatsmeow_mobile_pending WHERE phone=$1`, phone).Scan(&snapshot)
-	return snapshot, err
-}
-
-func (c *Container) DeletePendingMobileRegistration(ctx context.Context, phone string) error {
-	_, err := c.db.Exec(ctx, `DELETE FROM whatsmeow_mobile_pending WHERE phone=$1`, phone)
-	return err
-}
-
 // ErrDeviceIDMustBeSet is the error returned by PutDevice if you try to save a device before knowing its JID.
 var ErrDeviceIDMustBeSet = errors.New("device JID must be known before accessing database")
 
@@ -311,7 +302,8 @@ func (c *Container) PutDevice(ctx context.Context, device *store.Device) error {
 		device.SignedPreKey.Priv[:], device.SignedPreKey.KeyID, device.SignedPreKey.Signature[:],
 		device.AdvSecretKey, account.Details, account.AccountSignature, account.AccountSignatureKey, account.DeviceSignature,
 		device.Platform, device.BusinessName, device.PushName, uuid.NullUUID{UUID: device.FacebookUUID, Valid: device.FacebookUUID != uuid.Nil},
-		device.LIDMigrationTimestamp, device.CompanionMetaNonce, device.Mobile, device.MobileVersion, device.MobilePhoneID, device.MobileOSVersion, device.MobileModel,
+		device.LIDMigrationTimestamp, device.CompanionMetaNonce,
+		device.Mobile, device.MobileVersion, device.MobilePhoneID, device.MobileOSVersion, device.MobileModel, device.MobileManufacturer,
 	)
 	if err == nil {
 		var affected int64
@@ -341,5 +333,41 @@ func (c *Container) DeleteDevice(ctx context.Context, store *store.Device) error
 		return ErrDeviceIDMustBeSet
 	}
 	_, err := c.db.Exec(ctx, deleteDeviceQuery, store.ID)
+	return err
+}
+
+// GetPendingMobileRegistration retrieves a pending mobile registration snapshot.
+// Returns nil, nil if none exists.
+func (c *Container) GetPendingMobileRegistration(ctx context.Context, phone string) ([]byte, error) {
+	var snapshot []byte
+	err := c.db.QueryRow(ctx, `SELECT snapshot FROM whatsmeow_mobile_pending WHERE phone=$1`, phone).Scan(&snapshot)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return snapshot, err
+}
+
+// UpdatePendingMobileRegistration replaces a pending snapshot only if it matches the previous one.
+// This allows promoting a registration after successful remote confirmation.
+func (c *Container) UpdatePendingMobileRegistration(ctx context.Context, phone string, previous, snapshot []byte) error {
+	if phone == "" || len(previous) == 0 || len(snapshot) == 0 {
+		return errors.New("empty mobile registration")
+	}
+	result, err := c.db.Exec(ctx, `
+		UPDATE whatsmeow_mobile_pending SET snapshot=$1 WHERE phone=$2 AND snapshot=$3
+	`, snapshot, phone, previous)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count != 1 {
+		return errors.New("mobile registration already changed or missing")
+	}
+	return err
+}
+
+// DeletePendingMobileRegistration removes a pending mobile registration.
+func (c *Container) DeletePendingMobileRegistration(ctx context.Context, phone string) error {
+	_, err := c.db.Exec(ctx, `DELETE FROM whatsmeow_mobile_pending WHERE phone=$1`, phone)
 	return err
 }

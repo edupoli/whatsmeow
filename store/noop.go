@@ -261,6 +261,22 @@ func (n *NoopStore) DeleteDevice(ctx context.Context, store *Device) error {
 	return n.Error
 }
 
+func (n *NoopStore) PutPendingMobileRegistration(ctx context.Context, phone string, snapshot []byte) error {
+	return n.Error
+}
+
+func (n *NoopStore) GetPendingMobileRegistration(ctx context.Context, phone string) ([]byte, error) {
+	return nil, n.Error
+}
+
+func (n *NoopStore) UpdatePendingMobileRegistration(ctx context.Context, phone string, previous, snapshot []byte) error {
+	return n.Error
+}
+
+func (n *NoopStore) DeletePendingMobileRegistration(ctx context.Context, phone string) error {
+	return n.Error
+}
+
 func (n *NoopStore) GetBufferedEvent(ctx context.Context, ciphertextHash [32]byte) (*BufferedEvent, error) {
 	return nil, nil
 }

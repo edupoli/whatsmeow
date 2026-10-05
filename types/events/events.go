@@ -668,3 +668,17 @@ type NotifyAccountReachoutTimelock struct {
 	IsActive            bool                `json:"is_active,omitempty"`
 	TimeEnforcementEnds jsontime.UnixString `json:"time_enforcement_ends,omitzero"`
 }
+
+// MobileCodeRequested is emitted when a verification code has been requested for mobile primary device registration.
+type MobileCodeRequested struct {
+	Phone      string // Full phone number (CC + national number)
+	Method     string // Delivery method: "sms", "voice", "email_otp", or "wa_old"
+	Length     int    // Code length in digits
+	RetryAfter int    // Seconds until a new code can be requested
+}
+
+// MobileRegistered is emitted when mobile primary device registration completes successfully.
+type MobileRegistered struct {
+	Phone string // Full phone number (CC + national number)
+	LID   string // Linked Identity (hidden user server JID)
+}

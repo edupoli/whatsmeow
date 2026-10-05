@@ -31,7 +31,7 @@ client := whatsmeow.NewClient(device, nil)
 
 // phone is the full international number including the country code,
 // without "+" (e.g. "5543991665228"). The country code is detected automatically.
-sent, err := client.RequestMobileCode(ctx, phone)
+sent, err := client.RequestMobileCode(ctx, phone, "")
 if err != nil { return err }
 // The code is now dispatched out-of-band via sent.Method (sms, wa_old, ...).
 ```
@@ -54,11 +54,11 @@ the consent step required for fresh numbers via `/consent`. A server response of
 retry. No live registration request is made by the library without an explicit
 call.
 
-For lower-level control (persisting a pending registration across process
-restarts, choosing the method manually, answering CAPTCHA or 2FA challenges),
-see `MobileRegistration`, `NewMobileRegistration`, `Snapshot`,
-`RestoreMobileRegistration`, `CheckExists`, `RequestCode`, `VerifyCode`,
-`ConfirmConsent`, `ConfirmChallenge` and `ConfirmTwoFactorPIN`.
+To reuse the saved attempt after restarting, call `ResumeMobileRegistration(ctx, phone)`
+before `RegisterMobile`, without requesting a new code. For an existing 2FA PIN,
+use `RegisterMobileTwoFactor`. `DiscardMobileRegistration` explicitly discards a
+pending attempt. Lower-level HTTPS operations are available via
+`MobileRegistrationClient` and `MobileRegistrationState`.
 
 ## Features
 Most core features are already present:

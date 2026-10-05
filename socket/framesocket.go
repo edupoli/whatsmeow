@@ -32,25 +32,25 @@ type FrameSocket struct {
 	log        waLog.Logger
 	lock       sync.Mutex
 	sendLock   sync.Mutex
+	closed     atomic.Bool
 
 	URL         string
 	HTTPHeaders http.Header
 	HTTPClient  *http.Client
 
-	Frames       chan []byte
-	OnDisconnect func(ctx context.Context, remote bool)
-
-	Header []byte
-
-	closed atomic.Bool
-
+	Header         []byte
+	partialHeader  []byte
 	incomingLength int
 	receivedLength int
 	incoming       []byte
-	partialHeader  []byte
+
+	Frames       chan []byte
+	OnDisconnect func(ctx context.Context, remote bool)
 }
 
-type mobileConnection struct{ net.Conn }
+type mobileConnection struct {
+	net.Conn
+}
 
 func NewFrameSocket(log waLog.Logger, client *http.Client) *FrameSocket {
 	return &FrameSocket{
@@ -78,15 +78,15 @@ func (fs *FrameSocket) Close(code websocket.StatusCode) {
 
 	conn := fs.conn.Swap(nil)
 	mobile := fs.mobileConn.Swap(nil)
-	if conn == nil {
-		if mobile == nil {
-			return
-		}
-	} else {
+	if conn == nil && mobile == nil {
+		return
+	}
+
+	if conn != nil {
 		if code > 0 {
 			err := conn.Close(code, "")
 			if err != nil {
-				fs.log.Warnf("Error closing websocket: %v", err)
+				fs.log.Warnf("Error sending close to websocket: %v", err)
 			}
 		} else {
 			_ = conn.CloseNow()

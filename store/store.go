@@ -123,6 +123,13 @@ type ChatSettingsStore interface {
 type DeviceContainer interface {
 	PutDevice(ctx context.Context, store *Device) error
 	DeleteDevice(ctx context.Context, store *Device) error
+
+	// MobileRegistrationStore methods for primary device registration.
+	// Implementations must be atomic and preserve the exact snapshot bytes.
+	PutPendingMobileRegistration(ctx context.Context, phone string, snapshot []byte) error
+	GetPendingMobileRegistration(ctx context.Context, phone string) ([]byte, error)
+	UpdatePendingMobileRegistration(ctx context.Context, phone string, previous, snapshot []byte) error
+	DeletePendingMobileRegistration(ctx context.Context, phone string) error
 }
 
 type MessageSecretInsert struct {
@@ -219,16 +226,11 @@ type AllStores interface {
 type Device struct {
 	Log waLog.Logger
 
-	NoiseKey        *keys.KeyPair
-	IdentityKey     *keys.KeyPair
-	SignedPreKey    *keys.PreKey
-	RegistrationID  uint32
-	AdvSecretKey    []byte
-	Mobile          bool
-	MobileVersion   string
-	MobilePhoneID   string
-	MobileOSVersion string
-	MobileModel     string
+	NoiseKey       *keys.KeyPair
+	IdentityKey    *keys.KeyPair
+	SignedPreKey   *keys.PreKey
+	RegistrationID uint32
+	AdvSecretKey   []byte
 
 	ID  *types.JID
 	LID types.JID
@@ -259,6 +261,14 @@ type Device struct {
 	EventBuffer   EventBuffer
 	LIDs          LIDStore
 	Container     DeviceContainer
+
+	// Mobile primary device fields
+	Mobile             bool
+	MobileVersion      string
+	MobilePhoneID      string
+	MobileOSVersion    string
+	MobileModel        string
+	MobileManufacturer string
 }
 
 func (device *Device) GetJID() types.JID {
