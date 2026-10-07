@@ -24,6 +24,10 @@ var (
 	ErrMessageTimedOut         = errors.New("timed out waiting for message send response")
 	ErrMobileAlreadyRegistered = errors.New("device already registered; cannot start mobile registration")
 	ErrMobileAlreadyPending    = errors.New("a pending mobile registration already exists for this number; use ResumeMobileRegistration")
+	// ErrMobileCaptcha names the one continuation this build cannot answer. The
+	// server sent a challenge and there is no solver, so the attempt stops here
+	// rather than looping on it. The challenge image is on the error's response.
+	ErrMobileCaptcha = errors.New("mobile registration needs a captcha challenge, which this build does not solve")
 
 	ErrAlreadyConnected = errors.New("websocket is already connected")
 

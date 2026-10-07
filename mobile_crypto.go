@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -104,6 +105,15 @@ type MobileRegistrationState struct {
 	BackupToken   []byte // 20 bytes
 	AndroidID     []byte // 32 bytes
 
+	// Platform is "ios" or "android" and decides the User-Agent, the form field
+	// set and the registration token. Persisted because /code and /register must
+	// agree, and a resumed attempt re-signs both.
+	Platform string
+	// Android token material, read out of a real APK. Empty for the iOS profile.
+	AndroidSecretKey     []byte
+	AndroidCertificates  [][]byte
+	AndroidClassesDexMD5 []byte
+
 	// Locale and SIM, resolved once from the country code so every step of the
 	// registration agrees. A Brazilian number announcing en/US with no SIM
 	// describes a handset that does not exist.
@@ -115,6 +125,9 @@ type MobileRegistrationState struct {
 	// P256PrivateKey is the ECDSA P-256 key used to sign the H header. It must survive
 	// restarts because /code and /register are signed with the same key.
 	P256PrivateKey []byte // PKCS#8 DER
+
+	// Progress survives pod restarts alongside the identity. It never contains OTPs or PINs.
+	Progress *MobileRegistrationStatus
 }
 
 // Country metadata for the registration form.
@@ -260,7 +273,10 @@ var mobileCountryMeta = map[string]struct{ lg, lc, mcc, mnc string }{
 	"423": {"de", "LI", "295", "01"},
 }
 
-func resolveMobileLocale(cc, lang, country, mcc, mnc string) (string, string, string, string) {
+// ResolveMobileLocale resolves the locale and operator for a country code.
+// Empty overrides fall back to the country table; a caller that knows the SIM in
+// the phone should pass it, since a table keyed by calling code can only guess.
+func ResolveMobileLocale(cc, lang, country, mcc, mnc string) (string, string, string, string) {
 	meta, known := mobileCountryMeta[cc]
 	if !known {
 		// Unknown country: keep the form parseable, and do not invent an operator.
@@ -284,6 +300,7 @@ func resolveMobileLocale(cc, lang, country, mcc, mnc string) (string, string, st
 // Snapshot returns a JSON-serializable copy of the state.
 func (s *MobileRegistrationState) Snapshot() ([]byte, error) {
 	type snapshot struct {
+		Progress                                                                      *MobileRegistrationStatus `json:",omitempty"`
 		NoisePrivate                                                                  [32]byte
 		IdentityPrivate                                                               [32]byte
 		SignedPreKeyPrivate                                                           [32]byte
@@ -295,8 +312,13 @@ func (s *MobileRegistrationState) Snapshot() ([]byte, error) {
 		DeviceID, IdentityID, AccessSessionID                                         []byte
 		AdvertisingID, BackupToken, AndroidID                                         []byte
 		P256PrivateKey                                                                []byte
+		Platform                                                                      string
+		AndroidSecretKey                                                              []byte
+		AndroidCertificates                                                           [][]byte
+		AndroidClassesDexMD5                                                          []byte
 	}
 	snap := snapshot{
+		Progress:              s.Progress,
 		NoisePrivate:          s.NoisePrivate,
 		IdentityPrivate:       s.IdentityPrivate,
 		SignedPreKeyPrivate:   s.SignedPreKeyPrivate,
@@ -321,6 +343,10 @@ func (s *MobileRegistrationState) Snapshot() ([]byte, error) {
 		BackupToken:           s.BackupToken,
 		AndroidID:             s.AndroidID,
 		P256PrivateKey:        s.P256PrivateKey,
+		Platform:              s.Platform,
+		AndroidSecretKey:      s.AndroidSecretKey,
+		AndroidCertificates:   s.AndroidCertificates,
+		AndroidClassesDexMD5:  s.AndroidClassesDexMD5,
 	}
 	data, err := json.Marshal(snap)
 	if err != nil {
@@ -332,6 +358,7 @@ func (s *MobileRegistrationState) Snapshot() ([]byte, error) {
 // RestoreMobileRegistrationState reconstructs state from a snapshot.
 func RestoreMobileRegistrationState(data []byte) (*MobileRegistrationState, error) {
 	type snapshot struct {
+		Progress                                                                      *MobileRegistrationStatus
 		NoisePrivate                                                                  [32]byte
 		IdentityPrivate                                                               [32]byte
 		SignedPreKeyPrivate                                                           [32]byte
@@ -343,6 +370,10 @@ func RestoreMobileRegistrationState(data []byte) (*MobileRegistrationState, erro
 		DeviceID, IdentityID, AccessSessionID                                         []byte
 		AdvertisingID, BackupToken, AndroidID                                         []byte
 		P256PrivateKey                                                                []byte
+		Platform                                                                      string
+		AndroidSecretKey                                                              []byte
+		AndroidCertificates                                                           [][]byte
+		AndroidClassesDexMD5                                                          []byte
 	}
 	var snap snapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
@@ -355,6 +386,7 @@ func RestoreMobileRegistrationState(data []byte) (*MobileRegistrationState, erro
 		return nil, errors.New("invalid Android field lengths in snapshot")
 	}
 	var s MobileRegistrationState
+	s.Progress = snap.Progress
 	s.NoisePrivate = snap.NoisePrivate
 	s.IdentityPrivate = snap.IdentityPrivate
 	s.SignedPreKeyPrivate = snap.SignedPreKeyPrivate
@@ -370,7 +402,7 @@ func RestoreMobileRegistrationState(data []byte) (*MobileRegistrationState, erro
 	s.PhoneID = snap.PhoneID
 	// A snapshot written before this existed leaves them empty; re-resolve from the
 	// country code rather than sending a blank locale.
-	s.LocaleLanguage, s.LocaleCountry, s.SIMMCC, s.SIMMNC = resolveMobileLocale(
+	s.LocaleLanguage, s.LocaleCountry, s.SIMMCC, s.SIMMNC = ResolveMobileLocale(
 		s.CountryCode, snap.LocaleLanguage, snap.LocaleCountry, snap.SIMMCC, snap.SIMMNC)
 	copy(s.DeviceID[:], snap.DeviceID)
 	copy(s.IdentityID[:], snap.IdentityID)
@@ -379,6 +411,14 @@ func RestoreMobileRegistrationState(data []byte) (*MobileRegistrationState, erro
 	s.BackupToken = snap.BackupToken
 	s.AndroidID = snap.AndroidID
 	s.P256PrivateKey = snap.P256PrivateKey
+	// A snapshot written before this existed is an iOS attempt.
+	s.Platform = snap.Platform
+	if s.Platform == "" {
+		s.Platform = "ios"
+	}
+	s.AndroidSecretKey = snap.AndroidSecretKey
+	s.AndroidCertificates = snap.AndroidCertificates
+	s.AndroidClassesDexMD5 = snap.AndroidClassesDexMD5
 	return &s, nil
 }
 
@@ -387,7 +427,7 @@ func GenerateMobileRegistrationState(cc, national, version, osVersion, model, ma
 	if !validMobileVersion(version) {
 		return nil, errors.New("invalid mobile version")
 	}
-	lang, country, mcc, mnc := resolveMobileLocale(cc, "", "", "", "")
+	lang, country, mcc, mnc := ResolveMobileLocale(cc, "", "", "", "")
 	s := &MobileRegistrationState{
 		CountryCode:    cc,
 		NationalNumber: national,
@@ -547,12 +587,147 @@ var (
 		"access_session_id", "token", "push_token",
 		"code",
 	}
+
+	// The Android /exist and /register bodies are the iOS ones; the difference is
+	// the User-Agent, the headers and the token. The app-store fields ride on
+	// /code, which is why an Android attempt has to start at /code. None of them
+	// is the age signal though: reason=consent is answered by POST /consent, which
+	// is a separate request on either platform.
+	androidFormOrder = []string{
+		"cc", "in", "rc", "lg", "lc",
+		"authkey", "e_regid", "e_keytype", "e_ident", "e_skey_id",
+		"e_skey_val", "e_skey_sig", "fdid", "expid", "id",
+		"access_session_id", "token", "push_token",
+	}
+	androidCodeFormOrder = append(append([]string{}, androidFormOrder...),
+		"method", "sim_mcc", "sim_mnc",
+		"reason", "mcc", "mnc", "db", "sim_type", "network_radio_type",
+		"roaming_type", "device_ram", "cellular_strength", "prefer_sms_over_flash",
+		"simnum", "airplane_mode_type", "mistyped", "hasinrc",
+		"client_metrics", "pid",
+		"education_screen_displayed", "clicked_education_link", "tos_version",
+		"call_log_permission", "manage_call_permission",
+		"advertising_id", "backup_token", "aid",
+	)
+	androidRegisterFormOrder = append(append([]string{}, androidFormOrder...), "code")
 )
 
+// androidValues are the Android-only constants. They are read from the reference
+// rather than invented: device_ram comes off the declared handset, pid is derived
+// once per identity and stays put across /exist, /code and /register, and
+// client_metrics reports is_sim_absent from the operator actually declared.
+// The three request stages pick their field set from the platform. The Android
+// order is the iOS one plus the app-store fields. Note that none of these is the
+// age signal: reason=consent is answered by POST /consent, not by the profile.
+func (s *MobileRegistrationState) isAndroid() bool { return s.Platform == "android" }
+
+// fdid is uppercase on iOS and lowercase on Android, matching each native client.
+func (s *MobileRegistrationState) fdid() string {
+	if s.isAndroid() {
+		return strings.ToLower(s.PhoneID)
+	}
+	return strings.ToUpper(s.PhoneID)
+}
+
+func (s *MobileRegistrationState) existOrder() []string {
+	if s.isAndroid() {
+		return androidFormOrder
+	}
+	return iosFormOrder
+}
+
+func (s *MobileRegistrationState) codeOrder() []string {
+	if s.isAndroid() {
+		return androidCodeFormOrder
+	}
+	return iosCodeFormOrder
+}
+
+// MobileRegistrationStages are the three requests a registration makes, in order.
+const (
+	MobileStageExist    = "exist"
+	MobileStageCode     = "code"
+	MobileStageRegister = "register"
+)
+
+// DryRunFields builds the form for a stage and returns it as key/value pairs,
+// without contacting the server. It is the same call the request itself uses, so
+// what it prints is what would be sent.
+//
+// This exists so a profile can be verified offline: a misconfigured Android
+// attempt is refused with bad_token, and finding that out without spending a real
+// /code on a number is worth one helper.
+func (s *MobileRegistrationState) DryRunFields(stage, method, code string) ([]string, error) {
+	extra := map[string]string{}
+	switch stage {
+	case MobileStageExist:
+	case MobileStageCode:
+		extra["method"] = method
+	case MobileStageRegister:
+		extra["code"] = code
+	default:
+		return nil, fmt.Errorf("unknown stage %q: use %s, %s or %s",
+			stage, MobileStageExist, MobileStageCode, MobileStageRegister)
+	}
+	switch stage {
+	case MobileStageExist:
+		return s.BuildForm(s.existOrder(), extra)
+	case MobileStageCode:
+		return s.BuildForm(s.codeOrder(), extra)
+	default:
+		return s.BuildForm(s.registerOrder(), extra)
+	}
+}
+
+func (s *MobileRegistrationState) registerOrder() []string {
+	if s.isAndroid() {
+		return androidRegisterFormOrder
+	}
+	return iosRegisterFormOrder
+}
+
+func (s *MobileRegistrationState) androidValues(method string) map[string]string {
+	// Deterministic per identity on purpose: /exist, /code and /register are one
+	// running app, and a process does not change its pid between them.
+	sum := sha256.Sum256(append(s.IdentityID[:], 'p', 'i', 'd'))
+	pid := 1024 + int(binary.BigEndian.Uint32(sum[:4])%(32768-1024))
+	simAbsent := s.SIMMCC == "" || s.SIMMCC == "000"
+	metrics := fmt.Sprintf(
+		`{"attempts":1,"app_campaign_download_source":"google-play|unknown","is_sim_absent":%s}`,
+		map[bool]string{true: "true", false: "false"}[simAbsent])
+	return map[string]string{
+		"reason":                     "",
+		"mcc":                        s.SIMMCC,
+		"mnc":                        s.SIMMNC,
+		"db":                         "1",
+		"sim_type":                   "1",
+		"network_radio_type":         "1",
+		"roaming_type":               "0",
+		"device_ram":                 "5.62",
+		"cellular_strength":          "5",
+		"prefer_sms_over_flash":      "true",
+		"simnum":                     "0",
+		"airplane_mode_type":         "0",
+		"client_metrics":             url.QueryEscape(metrics),
+		"mistyped":                   "7",
+		"hasinrc":                    "1",
+		"education_screen_displayed": "true",
+		"tos_version":                "5",
+		"call_log_permission":        "false",
+		"manage_call_permission":     "false",
+		"clicked_education_link":     "false",
+		"pid":                        fmt.Sprintf("%d", pid),
+		"advertising_id":             s.AdvertisingID,
+		"backup_token":               percentEncode(s.BackupToken),
+		"aid":                        base64.RawURLEncoding.EncodeToString(s.AndroidID),
+	}
+}
+
 // BuildForm builds the registration form for the given field order.
-// The iOS path is the measured one: padded base64, md5 hex token, and a
-// push_token that is present but empty.
-func (s *MobileRegistrationState) BuildForm(order []string, extra map[string]string) []string {
+// The iOS path is the measured one: padded base64, md5 hex token, and no
+// push_token (an empty one is answered with bad_param).
+func (s *MobileRegistrationState) BuildForm(order []string, extra map[string]string) ([]string, error) {
+	method := extra["method"]
 	encode := base64.URLEncoding.EncodeToString
 	regID := make([]byte, 4)
 	binary.BigEndian.PutUint32(regID, s.RegistrationID)
@@ -576,11 +751,10 @@ func (s *MobileRegistrationState) BuildForm(order []string, extra map[string]str
 		"e_skey_id":         encode(preKeyID[1:]),
 		"e_skey_val":        encode(preKeyPub[:]),
 		"e_skey_sig":        encode(s.SignedPreKeySignature[:]),
-		"fdid":              strings.ToUpper(s.PhoneID),
+		"fdid":              s.fdid(),
 		"expid":             encode(s.DeviceID[:]),
 		"id":                string(percentEncode(s.IdentityID[:])),
 		"access_session_id": base64.RawURLEncoding.EncodeToString(s.AccessSessionID[:]),
-		"token":             ComputeRegistrationToken(s.Version, s.NationalNumber),
 		"push_token":        "",
 		"sim_mcc":           s.SIMMCC,
 		"sim_mnc":           s.SIMMNC,
@@ -588,6 +762,22 @@ func (s *MobileRegistrationState) BuildForm(order []string, extra map[string]str
 		"cellular_strength": "1",
 		"method":            "sms",
 		"code":              "",
+	}
+	if s.Platform == "android" {
+		token, err := (&AndroidTokenMaterial{
+			SecretKey:     s.AndroidSecretKey,
+			Certificates:  s.AndroidCertificates,
+			ClassesDexMD5: s.AndroidClassesDexMD5,
+		}).AndroidToken(s.NationalNumber)
+		if err != nil {
+			return nil, err
+		}
+		values["token"] = token
+		for k, v := range s.androidValues(method) {
+			values[k] = v
+		}
+	} else {
+		values["token"] = ComputeRegistrationToken(s.Version, s.NationalNumber)
 	}
 	for k, v := range extra {
 		values[k] = v
@@ -604,7 +794,7 @@ func (s *MobileRegistrationState) BuildForm(order []string, extra map[string]str
 		}
 		fields = append(fields, key, values[key])
 	}
-	return fields
+	return fields, nil
 }
 
 // percentEncodeBytes encodes a byte slice the way the client does: unreserved
@@ -662,10 +852,17 @@ func percentEncode(raw []byte) string {
 	return out.String()
 }
 
-// splitMobileNumber splits a phone number into country code and national number.
-// Uses the exact ITU country calling codes for deterministic parsing.
-func splitMobileNumber(phone string) (countryCode, nationalNumber string, err error) {
+// SplitMobileNumber splits a phone number into country code and national number.
+//
+// It matches the longest country code that is a real ITU calling code and leaves a
+// national number of a valid length, which is what makes a Brazilian 13-digit
+// number split as 55 + 10 digits rather than 554 + 9.
+func SplitMobileNumber(phone string) (countryCode, nationalNumber string, err error) {
+	// A number typed by a human arrives with spaces, dashes and parentheses; the
+	// same normalisation PairPhone already does, so one number cannot mean two
+	// things depending on which entry point it came through.
 	phone = strings.TrimSpace(phone)
+	phone = notNumbers.ReplaceAllString(phone, "")
 	phone = strings.TrimPrefix(phone, "+")
 	phone = strings.TrimPrefix(phone, "00")
 	phone = strings.TrimLeft(phone, "0") // remove leading zeros

@@ -48,11 +48,96 @@ return client.Connect()
 
 `RequestMobileCode` emits a `*events.MobileCodeRequested` event with the delivery
 details, and `RegisterMobile` emits `*events.MobileRegistered` on success.
-`RegisterMobile` validates the code via `/register` and automatically confirms
-the consent step required for fresh numbers via `/consent`. A server response of
+`RegisterMobile` validates the code via `/register`. A server response of
 `blocked` is returned as a `*MobileRegistrationError` without an automatic
 retry. No live registration request is made by the library without an explicit
 call.
+
+To ask which channels a number has before spending an attempt, use
+`ProbeRegistration`. It reads `/exist` only: no code is requested, no attempt is
+spent, and no pending registration is left behind, so it is safe to call as often
+as you like.
+
+```go
+elig, err := client.ProbeRegistration(ctx, phone)
+if err != nil { return err }
+// elig.Suggestion is a default to try first, or "" when nothing is usable now.
+for _, m := range elig.Methods {
+    log.Printf("%s supported=%v offered=%v wait=%ds", m.Method, m.Supported, m.Offered, m.WaitSeconds)
+}
+```
+
+It deliberately does not answer "which channel works", because `/exist` cannot.
+Measured against WhatsApp, a number that had never had an account and a number
+that already had one returned nearly identical replies: same `reason`, no `type`,
+every eligibility flag `0` and every wait `0`. What the reply does carry is
+therefore reported as separate facts per channel rather than collapsed into one
+available/unavailable flag:
+
+- `Supported` — whether this build can request the channel at all. `flash`,
+  `send_sms`, `passkey`, `password`, `acc_tr`, `silent_auth` and
+  `silent_auth_ts_43` are reported here as unsupported; the ones the server named
+  are also listed in `Unsupported`.
+- `Offered` — the server named it in `fallback_methods`/`recommended_method`, or
+  its eligibility flag is `1`. This is **not** evidence that it works: a number
+  the server listed as `sms`-eligible was answered `no_routes`.
+- `WaitSeconds` — a real cooldown. Zero means *unknown*, not ready; the waits only
+  turn non-zero once an attempt has been made.
+- `HasAccount` — true only when the server made an explicit offer that requires an
+  existing account (`wa_old`, `password`, `acc_tr`). `reason=incorrect` and `type`
+  are **not** used for this, because both came back the same way for a fresh
+  number. When it is true, the carrier channels (`sms`, `voice`) are reported as
+  not offered.
+
+A refusal is returned as data, not as an error: `Reason` carries `blocked`,
+`temporarily_unavailable` and the rest. An error is returned only when no reply
+arrived at all.
+
+To run the attempt itself, `RegisterWithMethod` drives the whole sequence over the
+channel you chose. The server answers `/register` with continuations rather than a
+final verdict — a code can be accepted and still need a PIN or an age signal — and
+this follows them, asking you for each value only when it is actually needed:
+
+```go
+verified, err := client.RegisterWithMethod(ctx, phone, "sms", whatsmeow.MobileRegistrationCallbacks{
+    Code: func(ctx context.Context, method string) (string, error) {
+        return askUser(fmt.Sprintf("enter the %s code", method))
+    },
+    TwoFactorPIN: func(ctx context.Context) (string, error) {
+        return askUser("enter your existing WhatsApp PIN")
+    },
+    AgeConsent: func(ctx context.Context) (whatsmeow.MobileAgeConsent, error) {
+        return whatsmeow.MobileAgeConsent{DOB: "1980-04-12"}, nil
+    },
+})
+```
+
+`Code` is the only callback that is required. Each one is asked at most once, which
+is what bounds the loop: a server that keeps asking for a value already supplied is
+returned as an error rather than retried. A continuation this build cannot answer
+stops the attempt too — a captcha challenge returns `ErrMobileCaptcha`, wrapping the
+`*MobileRegistrationError` so the challenge image is still reachable.
+
+If a callback fails, the attempt stays resumable: the code is already on its way, so
+`ResumeMobileRegistration(ctx, phone)` picks it up without spending another one.
+
+A `reason=consent` response is returned as an error with the saved attempt
+intact, so nothing is spent on a number the caller has no age signal for. The
+`pending` field of the server's answer is included in the error text, because it
+distinguishes a fresh number awaiting age verification (`pending=app_store_age`)
+from other consent states.
+
+To answer that gate, call `RegisterMobileWithConsent` with the account holder's
+date of birth. It posts the signal to `/consent` and completes the registration
+from that reply — there is no second `/register`, because a successful `/consent`
+is itself the registration completing. `MobileAgeConsent` also carries a Google
+Play Age Signals verdict (`AgeStatus`, `AgeLowerBound`, `AgeUpperBound`) for a
+caller that has a real one; that shape only means something when it came from a
+real app-store install.
+
+This has nothing to do with `MOBILE_OS=android`. The extra fields the Android
+request adds (`tos_version`, `education_screen_displayed`, `clicked_education_link`)
+belong to `/code` and do not clear an age gate.
 
 To reuse the saved attempt after restarting, call `ResumeMobileRegistration(ctx, phone)`
 before `RegisterMobile`, without requesting a new code. For an existing 2FA PIN,

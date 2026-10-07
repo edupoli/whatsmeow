@@ -1142,6 +1142,111 @@ func (cli *Client) SetMobileRegistrationEndpoint(endpoint string) {
 	}
 }
 
+// newMobileAttempt builds the state and HTTP client that /exist, /code and
+// /register share. It persists nothing: whether this becomes an attempt that has
+// to be resumed afterwards is the caller's decision, and a probe must not create
+// one by accident.
+func (cli *Client) newMobileAttempt(phone string) (*MobileRegistrationClient, string, error) {
+	cc, national, err := SplitMobileNumber(phone)
+	if err != nil {
+		return nil, "", err
+	}
+
+	profile := cli.MobileProfile
+	if profile.Version == "" {
+		profile = DefaultMobileProfile()
+	}
+	state, err := GenerateMobileRegistrationState(cc, national, profile.Version, profile.OSVersion, profile.Model, profile.Manufacturer)
+	if err != nil {
+		return nil, "", err
+	}
+	state.Platform = profile.OS
+	if state.Platform == "" {
+		state.Platform = "ios"
+	}
+	if profile.AndroidTokenMaterial != nil {
+		state.AndroidSecretKey = profile.AndroidTokenMaterial.SecretKey
+		state.AndroidCertificates = profile.AndroidTokenMaterial.Certificates
+		state.AndroidClassesDexMD5 = profile.AndroidTokenMaterial.ClassesDexMD5
+	}
+	// Fail before any network call: an Android attempt without APK material would
+	// be answered bad_token, and that costs a real attempt.
+	if state.Platform == "android" {
+		if _, err = (&AndroidTokenMaterial{SecretKey: state.AndroidSecretKey,
+			Certificates: state.AndroidCertificates, ClassesDexMD5: state.AndroidClassesDexMD5}).
+			AndroidToken(national); err != nil {
+			return nil, "", fmt.Errorf("android profile needs APK token material: %w", err)
+		}
+	}
+	state.LocaleLanguage, state.LocaleCountry, state.SIMMCC, state.SIMMNC = ResolveMobileLocale(
+		cc, profile.LocaleLanguage, profile.LocaleCountry, profile.SIMMCC, profile.SIMMNC)
+	cli.Log.Infof("Mobile profile: %s %s %s (%s/%s) %s, cc=%s sim=%s/%s",
+		state.Platform, state.Manufacturer, state.Model, state.Version, state.OSVersion,
+		state.LocaleCountry, cc, state.SIMMCC, state.SIMMNC)
+	p256Priv, err := state.P256Signer()
+	if err != nil {
+		return nil, "", err
+	}
+
+	client := NewMobileRegistrationClient(state, p256Priv)
+	client.HTTPClient = cli.preLoginHTTP
+	if cli.mobileRegistrationEndpoint != "" {
+		client.SetEndpoint(cli.mobileRegistrationEndpoint)
+	}
+	return client, cc + national, nil
+}
+
+// ProbeRegistration reads /exist for a number and reports what the server said
+// about every delivery channel, without asking for a code. It costs no attempt,
+// persists nothing and leaves no pending registration behind, so it is safe to
+// call to decide which channels to offer.
+//
+// The summary is deliberately not a verdict on which channel works. /exist cannot
+// support that question: a number with no account and a number that already has
+// one came back nearly identical when measured. What the reply does give is the
+// server's raw signals, a real cooldown for any channel that has one, which
+// channels this build cannot request at all, and a default worth trying first.
+func (cli *Client) ProbeRegistration(ctx context.Context, phone string) (*RegistrationEligibility, error) {
+	if cli == nil {
+		return nil, ErrClientIsNil
+	}
+	if !cli.mobileRegistrationLock.TryLock() {
+		return nil, errors.New("mobile registration already in progress")
+	}
+	defer cli.mobileRegistrationLock.Unlock()
+
+	// Nothing to probe for a number this device has already registered: the reply
+	// would describe a different account than the one being set up.
+	if cli.Store != nil && cli.Store.ID != nil {
+		return nil, ErrMobileAlreadyRegistered
+	}
+
+	client, _, err := cli.newMobileAttempt(phone)
+	if err != nil {
+		return nil, err
+	}
+
+	// The official app walks the onboarding funnel before /exist, and the server
+	// expects to have seen those requests.
+	if err := client.RunOnboardingFunnel(ctx); err != nil {
+		cli.Log.Warnf("Mobile onboarding funnel failed: %v", err)
+	}
+
+	resp, err := client.CheckExists(ctx)
+	if resp == nil {
+		// Nothing came back to summarise: a transport or parse failure, which is
+		// distinct from the server having answered and refused.
+		return nil, err
+	}
+	if err != nil {
+		// A parsed reply is the answer, not a failure of this call. reason=blocked
+		// and temporarily_unavailable are exactly what the caller needs to see, and
+		// the summary carries them. Logging keeps the refusal from passing silently.
+		cli.Log.Warnf("/exist refused: %v", err)
+	}
+	return resp.Eligibility(), nil
+}
+
 // RequestMobileCode starts primary device registration for a phone number.
 // It creates a registration identity, persists it to the store, checks eligibility via /exist,
 // and requests a verification code via /code. The code is delivered out-of-band (SMS, voice, email_otp, wa_old).
@@ -1164,11 +1269,13 @@ func (cli *Client) RequestMobileCode(ctx context.Context, phone, method string) 
 		return nil, ErrMobileAlreadyRegistered
 	}
 
-	cc, national, err := splitMobileNumber(phone)
+	client, phoneNorm, err := cli.newMobileAttempt(phone)
 	if err != nil {
 		return nil, err
 	}
-	phoneNorm := cc + national
+	// The resume and register paths sign with this key, so it has to outlive this
+	// call even though the state itself is persisted separately.
+	cli.mobileP256PrivateKey = client.P256PrivateKey
 
 	pendingStore, ok := cli.Store.Container.(store.DeviceContainer)
 	if !ok {
@@ -1178,49 +1285,20 @@ func (cli *Client) RequestMobileCode(ctx context.Context, phone, method string) 
 		return nil, ErrMobileAlreadyPending
 	}
 
-	// Generate registration state (includes the P-256 key used to sign H).
-	profile := cli.MobileProfile
-	if profile.Version == "" {
-		profile = DefaultMobileProfile()
+	client.State.Progress = &MobileRegistrationStatus{
+		Phone:         phoneNorm,
+		Stage:         MobileRegistrationChannels,
+		CodeAttempted: true,
 	}
-	state, err := GenerateMobileRegistrationState(cc, national, profile.Version, profile.OSVersion, profile.Model, profile.Manufacturer)
-	if err != nil {
-		return nil, err
-	}
-	state.LocaleLanguage, state.LocaleCountry, state.SIMMCC, state.SIMMNC = resolveMobileLocale(
-		cc, profile.LocaleLanguage, profile.LocaleCountry, profile.SIMMCC, profile.SIMMNC)
-	cli.Log.Infof("Mobile profile: %s %s (%s/%s) %s, cc=%s sim=%s/%s",
-		state.Manufacturer, state.Model, state.Version, state.OSVersion, state.LocaleCountry,
-		cc, state.SIMMCC, state.SIMMNC)
-	p256Priv, err := state.P256Signer()
-	if err != nil {
-		return nil, err
-	}
-	cli.mobileP256PrivateKey = p256Priv
-
-	// Persist snapshot BEFORE any network request
-	snapshot, err := state.Snapshot()
+	// The row means "an OTP is on its way". Nothing between here and a sent code
+	// makes that true, so the intention to send is persisted first and the attempt
+	// is only considered started once a reply is recorded.
+	snapshot, err := client.State.Snapshot()
 	if err != nil {
 		return nil, err
 	}
 	if err = pendingStore.PutPendingMobileRegistration(ctx, phoneNorm, snapshot); err != nil {
 		return nil, err
-	}
-	// The row means "an OTP is on its way". Nothing between here and a sent code
-	// makes that true, and a row left behind by a refused /code would tell the next
-	// run to resume an attempt the server never accepted.
-	codeSent := false
-	defer func() {
-		if !codeSent {
-			_ = pendingStore.DeletePendingMobileRegistration(ctx, phoneNorm)
-		}
-	}()
-
-	// Create client and do /exist
-	client := NewMobileRegistrationClient(state, cli.mobileP256PrivateKey)
-	client.HTTPClient = cli.preLoginHTTP
-	if cli.mobileRegistrationEndpoint != "" {
-		client.SetEndpoint(cli.mobileRegistrationEndpoint)
 	}
 
 	// The official app walks the onboarding funnel before /exist, and the server
@@ -1246,15 +1324,31 @@ func (cli *Client) RequestMobileCode(ctx context.Context, phone, method string) 
 	}
 	method = m
 
-	// Request code
-	codeResp, err := client.RequestCode(ctx, method)
+	// Store the client before requesting: the code call itself is journaled, and
+	// the response is recorded against this client.
+	cli.mobileRegistration = client
+
+	codeResp, err := cli.mobileOperation(ctx, "/code", method, func() (*MobileRegistrationResponse, error) {
+		return client.RequestCode(ctx, method)
+	})
+
+	// mobileOperation records the outcome before returning, so the stage read here is
+	// settled. The pending row is the whole record the panel rebuilds from, so it
+	// survives every stage the user can still act on — a code on its way, a cooldown,
+	// a channel the server would not route, a PIN or a date of birth it wants. It is
+	// dropped only when the attempt is finished and a new one is the only way forward:
+	// registered, blocked, a captcha this build cannot solve, or a dropped connection
+	// that left the outcome unknown.
+	stage := client.State.Progress.Stage
+	if stage != MobileRegistrationWaitingCode && stage != MobileRegistrationUnknown &&
+		stage != MobileRegistrationChannels && stage != MobileRegistrationWaitingPIN &&
+		stage != MobileRegistrationWaitingConsent {
+		_ = pendingStore.DeletePendingMobileRegistration(ctx, phoneNorm)
+		cli.mobileRegistration = nil
+	}
 	if err != nil {
 		return codeResp, err
 	}
-	codeSent = true
-
-	// Store the client for RegisterMobile
-	cli.mobileRegistration = client
 
 	cli.dispatchEvent(&events.MobileCodeRequested{
 		Phone:      phoneNorm,
@@ -1288,7 +1382,7 @@ func (cli *Client) ResumeMobileRegistration(ctx context.Context, phone string) e
 		return errors.New("mobile registration already in progress")
 	}
 
-	cc, national, err := splitMobileNumber(phone)
+	cc, national, err := SplitMobileNumber(phone)
 	if err != nil {
 		return err
 	}
@@ -1320,6 +1414,22 @@ func (cli *Client) ResumeMobileRegistration(ctx context.Context, phone string) e
 		return err
 	}
 	cli.mobileP256PrivateKey = p256Priv
+
+	// An attempt whose outcome was never recorded must not be resumed by sending
+	// again: the earlier request may still have reached WhatsApp. A stage that was
+	// recorded is the real position in the flow and is kept as it is.
+	if state.Progress == nil {
+		state.Progress = &MobileRegistrationStatus{
+			Phone:         phoneNorm,
+			Stage:         MobileRegistrationUnknown,
+			CodeAttempted: state.P256PrivateKey != nil,
+		}
+	} else {
+		state.Progress.Phone = phoneNorm
+		if state.Progress.Stage == "" {
+			state.Progress.Stage = MobileRegistrationUnknown
+		}
+	}
 
 	client := NewMobileRegistrationClient(state, p256Priv)
 	client.HTTPClient = cli.preLoginHTTP
@@ -1354,7 +1464,7 @@ func (cli *Client) DiscardMobileRegistration(ctx context.Context, phone string) 
 	if !ok {
 		return errors.New("device store does not support mobile registration persistence")
 	}
-	cc, national, err := splitMobileNumber(phone)
+	cc, national, err := SplitMobileNumber(phone)
 	if err != nil {
 		return err
 	}
@@ -1366,20 +1476,19 @@ func (cli *Client) DiscardMobileRegistration(ctx context.Context, phone string) 
 	return container.DeletePendingMobileRegistration(ctx, cc+national)
 }
 
-// RegisterMobile completes registration by verifying the OTP code via /register.
-// If the server responds with reason=consent, it automatically calls /consent.
-// If reason=security_code, call RegisterMobileTwoFactor with the PIN.
-// On success, the device is persisted and the client is ready for Connect().
-func (cli *Client) RegisterMobile(ctx context.Context, code string) (*MobileRegistrationResponse, error) {
-	return cli.registerMobile(ctx, code, false)
-}
-
-// RegisterMobileTwoFactor completes the security_code (2FA PIN) step.
-func (cli *Client) RegisterMobileTwoFactor(ctx context.Context, pin string) (*MobileRegistrationResponse, error) {
-	return cli.registerMobile(ctx, pin, true)
-}
-
-func (cli *Client) registerMobile(ctx context.Context, code string, twoFactor bool) (*MobileRegistrationResponse, error) {
+// SubmitMobileCode verifies an OTP the user typed, against the identity that a
+// previous RequestMobileCode or ResumeMobileRegistration established.
+//
+// It is one step of a longer exchange, not the whole of it. The server may accept
+// the code and still answer security_code, or hold the account for consent; each of
+// those is a separate call (RegisterMobileTwoFactor, RegisterMobileWithConsent) and
+// each is recorded in the saved status. That split is what lets a worker drive the
+// flow from a queue, one user action per message, instead of holding a goroutine
+// open waiting for a frontend.
+//
+// A wrong OTP comes back as a *MobileRegistrationError and leaves the attempt
+// resumable: the saved status stays on waiting_code.
+func (cli *Client) SubmitMobileCode(ctx context.Context, code string) (*MobileRegistrationResponse, error) {
 	if cli == nil {
 		return nil, ErrClientIsNil
 	}
@@ -1387,32 +1496,76 @@ func (cli *Client) registerMobile(ctx context.Context, code string, twoFactor bo
 		return nil, errors.New("mobile registration already in progress")
 	}
 	defer cli.mobileRegistrationLock.Unlock()
-
 	if cli.mobileRegistration == nil {
 		return nil, errors.New("no mobile registration in progress; call RequestMobileCode or ResumeMobileRegistration first")
 	}
-
-	client := cli.mobileRegistration
-	var resp *MobileRegistrationResponse
-	var err error
-
-	if twoFactor {
-		resp, err = client.ConfirmTwoFactorPIN(ctx, code)
-	} else {
-		resp, err = client.VerifyCode(ctx, code)
-		if err != nil {
-			var regErr *MobileRegistrationError
-			if errors.As(err, &regErr) && regErr.Response.Reason == "consent" {
-				// New account needs consent
-				resp, err = client.ConfirmConsent(ctx)
-			}
+	if progress := cli.mobileRegistration.State.Progress; progress != nil {
+		if err := checkMobileStep(progress, MobileRegistrationWaitingCode, progress.Method); err != nil {
+			return nil, err
 		}
 	}
-	if err != nil {
-		return resp, err
-	}
+	return cli.mobileOperation(ctx, "/register", "", func() (*MobileRegistrationResponse, error) {
+		return cli.registerMobileLocked(ctx, code, false, nil)
+	})
+}
 
-	// Success - promote device
+// RegisterMobile completes registration by verifying the OTP code via /register.
+// If the server responds with reason=security_code, call RegisterMobileTwoFactor
+// with the PIN. On success, the device is persisted and the client is ready for
+// Connect().
+//
+// reason=consent is returned as an error and the saved attempt is left intact, so
+// nothing is spent on a number the caller has no age signal for. The answer to
+// that gate is a separate request — POST /consent, carrying the account holder's
+// date of birth — and it is not the Android profile that clears it: the consent
+// fields the Android request adds (tos_version, education_screen_displayed,
+// clicked_education_link) belong to /code and do nothing here.
+//
+// Use RegisterMobileWithConsent when the caller has the date of birth.
+func (cli *Client) RegisterMobile(ctx context.Context, code string) (*MobileRegistrationResponse, error) {
+	return cli.registerMobile(ctx, code, false, nil)
+}
+
+// SubmitMobileAgeConsent answers the consent gate directly on /consent, without
+// presenting the OTP again.
+//
+// The OTP was already accepted: the server answered the earlier /register by holding
+// the account, which is what this gate means. Presenting it a second time would spend
+// another attempt for nothing, and attempts are what earn a too_recent. It also makes
+// this usable after a restart, where the caller holds no code and the pending row is
+// all that survived.
+//
+// The reply is the registration: it carries the account, and this promotes the device
+// from it. Returns ErrMobileRegistrationState if no attempt is waiting on consent.
+func (cli *Client) SubmitMobileAgeConsent(ctx context.Context, consent MobileAgeConsent) (*MobileRegistrationResponse, error) {
+	if cli == nil {
+		return nil, ErrClientIsNil
+	}
+	if !cli.mobileRegistrationLock.TryLock() {
+		return nil, errors.New("mobile registration already in progress")
+	}
+	defer cli.mobileRegistrationLock.Unlock()
+	if cli.mobileRegistration == nil {
+		return nil, errors.New("no mobile registration in progress; call RequestMobileCode or ResumeMobileRegistration first")
+	}
+	if progress := cli.mobileRegistration.State.Progress; progress != nil {
+		if err := checkMobileStep(progress, MobileRegistrationWaitingConsent, ""); err != nil {
+			return nil, err
+		}
+	}
+	return cli.mobileOperation(ctx, "/consent", "", func() (*MobileRegistrationResponse, error) {
+		resp, err := cli.mobileRegistration.ConfirmConsent(ctx, consent)
+		if err == nil {
+			return cli.promoteMobileDevice(ctx, resp)
+		}
+		return resp, err
+	})
+}
+
+// promoteMobileDevice turns a completed registration reply into a saved device.
+// Split out of registerMobile so a reply that completes the registration on another
+// endpoint — /consent — promotes the device the same way a /register success does.
+func (cli *Client) promoteMobileDevice(ctx context.Context, resp *MobileRegistrationResponse) (*MobileRegistrationResponse, error) {
 	phone := resp.Login
 	if phone == "" {
 		phone = cli.mobileRegistration.State.CountryCode + cli.mobileRegistration.State.NationalNumber
@@ -1421,12 +1574,9 @@ func (cli *Client) registerMobile(ctx context.Context, code string, twoFactor bo
 		return resp, errors.New("invalid login from server")
 	}
 
-	advSecretKey := cli.Store.AdvSecretKey
-
 	jid := types.NewJID(phone, types.DefaultUserServer)
+	jidPtr := &jid
 
-	// Build Device from the registration state, reusing the exact keys that were
-	// sent to /register so the Noise handshake and Signal pre-keys match.
 	state := cli.mobileRegistration.State
 	device := &store.Device{
 		Log:                cli.Store.Log,
@@ -1435,8 +1585,8 @@ func (cli *Client) registerMobile(ctx context.Context, code string, twoFactor bo
 		IdentityKey:        keys.NewKeyPairFromPrivateKey(state.IdentityPrivate),
 		SignedPreKey:       &keys.PreKey{KeyPair: *keys.NewKeyPairFromPrivateKey(state.SignedPreKeyPrivate), KeyID: state.SignedPreKeyID, Signature: &state.SignedPreKeySignature},
 		RegistrationID:     state.RegistrationID,
-		AdvSecretKey:       advSecretKey,
-		ID:                 &jid,
+		AdvSecretKey:       cli.Store.AdvSecretKey,
+		ID:                 jidPtr,
 		Mobile:             true,
 		MobileVersion:      state.Version,
 		MobilePhoneID:      state.PhoneID,
@@ -1450,38 +1600,260 @@ func (cli *Client) registerMobile(ctx context.Context, code string, twoFactor bo
 		// with the same primitives pair.go verifies.
 		Account: buildMobileADVIdentity(keys.NewKeyPairFromPrivateKey(state.IdentityPrivate)),
 	}
-
-	if err = device.Save(ctx); err != nil {
+	if err := device.Save(ctx); err != nil {
 		return resp, fmt.Errorf("registered phone but failed to persist mobile device: %w", err)
 	}
-
-	// Clean up pending registration
 	pendingStore := cli.Store.Container.(store.DeviceContainer)
-	if err = pendingStore.DeletePendingMobileRegistration(ctx, state.CountryCode+state.NationalNumber); err != nil {
+	if err := pendingStore.DeletePendingMobileRegistration(ctx, state.CountryCode+state.NationalNumber); err != nil {
 		return resp, fmt.Errorf("device registered but failed to remove pending registration: %w", err)
 	}
 
-	// Continue with the newly registered device instead of the pre-registration one.
 	cli.Store = device
 	cli.paired.Store(true)
-	cli.dispatchEvent(&events.MobileRegistered{
-		Phone: phone,
-		LID:   resp.LID,
-	})
-
+	cli.dispatchEvent(&events.MobileRegistered{Phone: phone, LID: resp.LID})
 	return resp, nil
 }
 
-// MobileRegistrationStatus describes the saved state of a mobile registration attempt.
+// RegisterMobileWithConsent is RegisterMobile with an age signal to answer the
+// consent gate with.
+//
+// On reason=consent it posts the signal to /consent and completes the registration
+// from that reply. There is deliberately no second /register: on a successful
+// /consent the official client files the reply's jid and lid as the registration
+// identity and *cancels* the registration-retry alarm (WaConsentRepository.A00,
+// whose C14Y.A0I call is logged as "reg_retry_verification_timer_canceled").
+// Repeating /register would spend a second attempt on the number for nothing, and
+// attempts are what earn a too_recent.
+func (cli *Client) RegisterMobileWithConsent(ctx context.Context, code string, consent MobileAgeConsent) (*MobileRegistrationResponse, error) {
+	return cli.registerMobile(ctx, code, false, &consent)
+}
+
+// RegisterMobileTwoFactor completes the security_code (2FA PIN) step.
+func (cli *Client) RegisterMobileTwoFactor(ctx context.Context, pin string) (*MobileRegistrationResponse, error) {
+	return cli.registerMobile(ctx, pin, true, nil)
+}
+
+// MobileRegistrationCallbacks supplies the values a registration attempt needs
+// partway through, so a whole attempt can run without the caller reimplementing
+// the server's sequencing.
+//
+// Every callback is optional except Code, and every one is asked at most once. A
+// value that is never needed is never asked for, so an iOS-only attempt is not
+// blocked on a PIN prompt.
+type MobileRegistrationCallbacks struct {
+	// Code supplies the code delivered out-of-band. It is asked once, with the
+	// channel the server actually used, which is not necessarily the one
+	// requested: the server may answer /code with a different method.
+	Code func(ctx context.Context, method string) (string, error)
+
+	// TwoFactorPIN supplies an existing PIN when the server answers
+	// reason=security_code.
+	TwoFactorPIN func(ctx context.Context) (string, error)
+
+	// AgeConsent supplies the account holder's date of birth when the server holds
+	// the account pending consent. The signal goes to /consent; the code is not
+	// re-sent and no new attempt is made.
+	AgeConsent func(ctx context.Context) (MobileAgeConsent, error)
+}
+
+// RegisterWithMethod runs a whole mobile registration over a delivery channel the
+// caller chose, driving the server's continuations as they arrive: the code, an
+// existing two-factor PIN, an age signal. It returns once the account is
+// registered.
+//
+// Choose the channel with ProbeRegistration first, which costs no attempt:
+// /exist cannot tell which channels work, so the choice belongs to the caller.
+// Passing an empty method falls back to the server's preference.
+//
+// A continuation this build cannot answer stops the attempt rather than spinning:
+// a captcha challenge returns ErrMobileCaptcha. A refusal from the server is
+// returned as a *MobileRegistrationError with its reason intact, and the attempt
+// stays resumable with ResumeMobileRegistration.
+func (cli *Client) RegisterWithMethod(ctx context.Context, phone, method string, cb MobileRegistrationCallbacks) (*MobileRegistrationResponse, error) {
+	if cb.Code == nil {
+		return nil, errors.New("mobile registration needs a Code callback to supply the code")
+	}
+
+	// /exist and /code, so the server's own pick of channel is visible to Code.
+	sent, err := cli.RequestMobileCode(ctx, phone, method)
+	if err != nil {
+		return nil, err
+	}
+	code, err := cb.Code(ctx, sent.Method)
+	if err != nil {
+		return nil, err
+	}
+	return cli.ContinueMobileRegistration(ctx, code, cb)
+}
+
+// ContinueMobileRegistration completes an attempt whose code has already been
+// requested, driving the same continuations as RegisterWithMethod. Use it after
+// ResumeMobileRegistration, when a code arrived for an attempt made earlier and
+// asking for another would spend a second one.
+//
+// Code is not consulted: the code was requested by whoever made the attempt. The PIN
+// and age-signal callbacks are asked only if the server turns out to need them.
+func (cli *Client) ContinueMobileRegistration(ctx context.Context, code string, cb MobileRegistrationCallbacks) (*MobileRegistrationResponse, error) {
+	resp, err := cli.RegisterMobile(ctx, code)
+
+	// The server answers /register with continuations rather than a final verdict:
+	// a code can be accepted and still need a PIN or an age signal. Each iteration
+	// makes exactly one call and decides the next from that call's answer. Asking
+	// each value once is what bounds the loop — a server that keeps asking for
+	// something already supplied is reported, not retried.
+	var askedPIN, askedConsent bool
+	for err != nil {
+		var regErr *MobileRegistrationError
+		if !errors.As(err, &regErr) {
+			return resp, err
+		}
+		switch {
+		case regErr.Response.IsChallenge():
+			// Both wrapped, so the caller can branch on ErrMobileCaptcha and still
+			// reach the challenge image and the rest of the server's diagnostic on
+			// the *MobileRegistrationError underneath.
+			return resp, fmt.Errorf("%w: %w", ErrMobileCaptcha, err)
+
+		case regErr.Response.Reason == "security_code" && !askedPIN:
+			if cb.TwoFactorPIN == nil {
+				return resp, fmt.Errorf("the server wants the existing two-factor PIN and no TwoFactorPIN callback was given: %w", err)
+			}
+			askedPIN = true
+			pin, perr := cb.TwoFactorPIN(ctx)
+			if perr != nil {
+				return resp, perr
+			}
+			resp, err = cli.RegisterMobileTwoFactor(ctx, pin)
+
+		case isMobileConsentGate(&regErr.Response) && !askedConsent:
+			if cb.AgeConsent == nil {
+				return resp, fmt.Errorf("the server is holding the account pending consent (pending=%s) and no AgeConsent callback was given: %w",
+					regErr.Response.Pending, err)
+			}
+			askedConsent = true
+			consent, cerr := cb.AgeConsent(ctx)
+			if cerr != nil {
+				return resp, cerr
+			}
+			// The code was accepted; the account is held for an age signal. Consent
+			// is a separate endpoint and its reply is the registration — no new
+			// attempt, no new code. It does go through registerMobile, so the
+			// accepted code is presented to /register once more on the way, which
+			// is the sequence the consent flow was verified against end to end.
+			resp, err = cli.RegisterMobileWithConsent(ctx, code, consent)
+
+		default:
+			// Either a refusal with no continuation left to give, or the server
+			// asking again for a value already supplied.
+			return resp, err
+		}
+	}
+	return resp, nil
+}
+
+func (cli *Client) registerMobile(ctx context.Context, code string, twoFactor bool, consent *MobileAgeConsent) (*MobileRegistrationResponse, error) {
+	if cli == nil {
+		return nil, ErrClientIsNil
+	}
+	if !cli.mobileRegistrationLock.TryLock() {
+		return nil, errors.New("mobile registration already in progress")
+	}
+	defer cli.mobileRegistrationLock.Unlock()
+	return cli.registerMobileLocked(ctx, code, twoFactor, consent)
+}
+
+// registerMobileLocked is registerMobile without the lock, for callers that already
+// hold it in order to journal the request and its outcome together.
+func (cli *Client) registerMobileLocked(ctx context.Context, code string, twoFactor bool, consent *MobileAgeConsent) (*MobileRegistrationResponse, error) {
+	if cli.mobileRegistration == nil {
+		return nil, errors.New("no mobile registration in progress; call RequestMobileCode or ResumeMobileRegistration first")
+	}
+
+	client := cli.mobileRegistration
+	var resp *MobileRegistrationResponse
+	var err error
+
+	if twoFactor {
+		resp, err = client.ConfirmTwoFactorPIN(ctx, code)
+	} else {
+		resp, err = client.VerifyCode(ctx, code)
+	}
+	if err != nil && consent != nil && isMobileConsentGate(resp) {
+		// The code was accepted; the server is holding the account for an age
+		// signal. Answer it on /consent, and take that reply as the result.
+		gatedErr := err
+		resp, err = client.ConfirmConsent(ctx, *consent)
+		if err == nil {
+			// The consent reply carries the account, but not always its number;
+			// the client falls back to the one it filed before the gate.
+			var regErr *MobileRegistrationError
+			hasGate := errors.As(gatedErr, &regErr)
+			if resp.Login == "" && hasGate {
+				resp.Login = regErr.Response.Login
+			}
+			if resp.LID == "" && hasGate {
+				resp.LID = regErr.Response.LID
+			}
+		}
+	}
+	if err != nil {
+		return resp, err
+	}
+
+	// The reply completed the registration: persist the device and drop the attempt.
+	// A reply that arrived on /consent takes this same path, via SubmitMobileAgeConsent.
+	return cli.promoteMobileDevice(ctx, resp)
+}
+
+// MobileRegistrationStatus is the saved state of a mobile registration attempt: the
+// last answer from WhatsApp plus where the attempt stands. It is persisted in the
+// same snapshot as the identity, so it survives a pod restart, and it deliberately
+// holds no OTP or PIN — those are supplied per command and never stored.
+//
+// Every field is a fact about the last completed exchange, so a caller can rebuild
+// a panel from it without contacting WhatsApp.
 type MobileRegistrationStatus struct {
-	Phone         string
+	Phone string
+
+	// Stage is what the attempt is waiting on: one of the MobileRegistration*
+	// constants. outcome_unknown means a request was sent and no reply was recorded,
+	// and it must be confirmed by the user before anything is sent again.
+	Stage string
+	// Operation is the endpoint of the in-flight or last request: /exist, /code,
+	// /register or /consent. Empty before the first request.
+	Operation string
+	// Method is the channel the last /code used.
+	Method string
+
 	CodeAttempted bool
-	Method        string
 	CodeRespAt    int64
-	ExistResponse *MobileRegistrationResponse
 	CodeResponse  *MobileRegistrationResponse
-	Registered    bool
-	LID           string
+	ExistResponse *MobileRegistrationResponse
+	// LastResponse is the most recent parsed answer from any stage.
+	LastResponse *MobileRegistrationResponse
+	// HTTPStatus is that answer's status code, or 0 when no answer was recorded.
+	HTTPStatus int
+
+	// RetryAt is the earliest time the server said to retry, in Unix seconds.
+	RetryAt int64
+	// RetryAtByMethod is a per-channel cooldown, because the server sets *_wait per
+	// channel and they do not move together.
+	RetryAtByMethod map[string]int64
+
+	Registered bool
+	LID        string
+	// UpdatedAt is a Unix timestamp of the last recorded exchange.
+	UpdatedAt int64
+}
+
+// Blocked reports whether WhatsApp refused this attempt outright.
+func (s *MobileRegistrationStatus) Blocked() bool {
+	return s != nil && s.Stage == MobileRegistrationBlocked
+}
+
+// Awaiting reports whether the attempt is waiting on a value the user must supply.
+func (s *MobileRegistrationStatus) Awaiting(stage string) bool {
+	return s != nil && s.Stage == stage
 }
 
 // GetMobileRegistrationStatus returns the saved state of a pending registration without making network requests.
@@ -1489,7 +1861,7 @@ func (cli *Client) GetMobileRegistrationStatus(ctx context.Context, phone string
 	if cli == nil {
 		return nil, ErrClientIsNil
 	}
-	cc, national, err := splitMobileNumber(phone)
+	cc, national, err := SplitMobileNumber(phone)
 	if err != nil {
 		return nil, err
 	}
@@ -1511,12 +1883,20 @@ func (cli *Client) GetMobileRegistrationStatus(ctx context.Context, phone string
 	if err != nil {
 		return nil, err
 	}
-	_ = state
-
+	if state.Progress != nil {
+		// A snapshot written before Progress existed has a real identity and an
+		// unknown position in the flow. Reporting unknown is the safe reading: the
+		// caller asks the user rather than resending.
+		state.Progress.Phone = phoneNorm
+		if state.Progress.Stage == "" {
+			state.Progress.Stage = MobileRegistrationUnknown
+		}
+		return state.Progress, nil
+	}
 	return &MobileRegistrationStatus{
-		Phone: phoneNorm,
-		// Note: CodeAttempted/Method/CodeRespAt require the Android bridge to persist them.
-		// These fields are not yet implemented in the Go-only flow.
+		Phone:         phoneNorm,
+		Stage:         MobileRegistrationUnknown,
+		CodeAttempted: state.P256PrivateKey != nil,
 	}, nil
 }
 
