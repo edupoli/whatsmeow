@@ -1378,15 +1378,18 @@ func (cli *Client) ResumeMobileRegistration(ctx context.Context, phone string) e
 	if cli.Store.ID != nil {
 		return ErrMobileAlreadyRegistered
 	}
-	if cli.mobileRegistration != nil {
-		return errors.New("mobile registration already in progress")
-	}
-
 	cc, national, err := SplitMobileNumber(phone)
 	if err != nil {
 		return err
 	}
 	phoneNorm := cc + national
+	if cli.mobileRegistration != nil {
+		state := cli.mobileRegistration.State
+		if state.CountryCode+state.NationalNumber == phoneNorm {
+			return nil
+		}
+		return errors.New("mobile registration already in progress for another phone")
+	}
 
 	pendingStore, ok := cli.Store.Container.(store.DeviceContainer)
 	if !ok {
@@ -1759,6 +1762,18 @@ func (cli *Client) registerMobile(ctx context.Context, code string, twoFactor bo
 		return nil, errors.New("mobile registration already in progress")
 	}
 	defer cli.mobileRegistrationLock.Unlock()
+	// Interactive PIN commands must persist their continuation just like OTP commands.
+	if twoFactor && cli.mobileRegistration != nil {
+		progress := cli.mobileRegistration.State.Progress
+		if progress != nil && progress.Stage == MobileRegistrationWaitingPIN {
+			if err := checkMobileStep(progress, MobileRegistrationWaitingPIN, ""); err != nil {
+				return nil, err
+			}
+			return cli.mobileOperation(ctx, "/register", "", func() (*MobileRegistrationResponse, error) {
+				return cli.registerMobileLocked(ctx, code, true, consent)
+			})
+		}
+	}
 	return cli.registerMobileLocked(ctx, code, twoFactor, consent)
 }
 
