@@ -177,7 +177,18 @@ func checkMobileStep(p *MobileRegistrationStatus, stage, method string) error {
 	if p.Stage != stage {
 		return fmt.Errorf("%w: stage=%s, expected=%s", ErrMobileRegistrationState, p.Stage, stage)
 	}
-	retryAt := max(p.RetryAt, p.RetryAtByMethod[method])
+	// A trava é a espera do próprio canal, não o retry_after global.
+	//
+	// O servidor devolve retry_after igual ao *_wait do canal que foi pedido — num
+	// log real, retry_after=172555 e sms_wait=172555 no mesmo /code, com voice_wait
+	// em 1555 e wa_old_wait em 0. Tratar retry_after como trava global deixaria os
+	// quatro canais bloqueados por 48h, incluindo o wa_old que o servidor disse estar
+	// livre. Pior: p.RetryAt é um max que nunca diminui, então a trava sobreviveria
+	// a qualquer resposta posterior.
+	//
+	// Os *_wait por canal permanecem sendo a autoridade, e é deles que o painel monta
+	// a contagem regressiva.
+	retryAt := p.RetryAtByMethod[method]
 	if retryAt > time.Now().Unix() {
 		return &MobileCooldownError{RetryAt: retryAt}
 	}
