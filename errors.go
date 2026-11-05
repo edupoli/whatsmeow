@@ -157,6 +157,7 @@ var (
 	ErrNotEncryptedCommentMessage    = errors.New("given message isn't an encrypted comment message")
 	ErrNotSecretEncryptedMessage     = errors.New("given message isn't a secret encrypted message")
 	ErrNotPollUpdateMessage          = errors.New("given message isn't a poll update message")
+	ErrNotEncryptedEventResponse     = errors.New("given message isn't an encrypted event response message")
 )
 
 type wrappedIQError struct {

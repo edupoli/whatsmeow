@@ -262,6 +262,33 @@ func (cli *Client) DecryptReaction(ctx context.Context, reaction *events.Message
 	return &msg, nil
 }
 
+// DecryptEventResponse decrypts an event RSVP message (participant answering GOING/NOT_GOING/MAYBE to a group event).
+//
+//	if evt.Message.GetEncEventResponseMessage() != nil {
+//		response, err := cli.DecryptEventResponse(evt)
+//		if err != nil {
+//			fmt.Println(":(", err)
+//			return
+//		}
+//		fmt.Printf("Event response: %+v\n", response)
+//	}
+func (cli *Client) DecryptEventResponse(ctx context.Context, evt *events.Message) (*waE2E.EventResponseMessage, error) {
+	encEventResponse := evt.Message.GetEncEventResponseMessage()
+	if encEventResponse == nil {
+		return nil, ErrNotEncryptedEventResponse
+	}
+	plaintext, err := cli.decryptMsgSecret(ctx, evt, EncSecretEventResponse, encEventResponse, encEventResponse.GetEventCreationMessageKey())
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt event response: %w", err)
+	}
+	var msg waE2E.EventResponseMessage
+	err = proto.Unmarshal(plaintext, &msg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode event response protobuf: %w", err)
+	}
+	return &msg, nil
+}
+
 // DecryptComment decrypts a reply/comment message in a community announcement group.
 //
 //	if evt.Message.GetEncCommentMessage() != nil {
